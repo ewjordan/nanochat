@@ -31,6 +31,8 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (MQA)
     n_embd: int = 768
+    recurrent_layer_state: bool = False # enable recurrent layer state passing
+    num_recurrence_warmup: int = 1 # number of warmup passes for training
 
 
 def norm(x):
@@ -144,6 +146,11 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Recurrent layer state gating mechanism
+        if config.recurrent_layer_state:
+            self.state_gate = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
+        else:
+            self.state_gate = None
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
@@ -162,6 +169,9 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
+        # zero out state_gate weights (start with pass-through behavior)
+        if self.state_gate is not None:
+            torch.nn.init.zeros_(self.state_gate.weight)
         # init the rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -213,8 +223,10 @@ class GPT(nn.Module):
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
+        # Separate out all parameters into groups (matrix, embedding, lm_head, state_gate)
         matrix_params = list(self.transformer.h.parameters())
+        if self.state_gate is not None:
+            matrix_params.extend(list(self.state_gate.parameters()))
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
@@ -241,7 +253,7 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', prev_state=None, return_state=False):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
@@ -254,10 +266,20 @@ class GPT(nn.Module):
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
+
+        # Mix with previous token's final layer state if provided
+        if prev_state is not None and self.state_gate is not None:
+            # Concatenate token embedding and previous state, then apply learned gating
+            gate_input = torch.cat([x, prev_state], dim=-1)  # (B, T, 2*n_embd)
+            x = self.state_gate(gate_input)  # (B, T, n_embd)
+
         x = norm(x)
         for block in self.transformer.h:
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
+
+        # Capture final state before lm_head
+        final_state = x
 
         # Forward the lm_head (compute logits)
         softcap = 15
@@ -268,12 +290,44 @@ class GPT(nn.Module):
             logits = softcap * torch.tanh(logits / softcap) # logits softcap
             logits = logits.float() # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if return_state:
+                return loss, final_state
             return loss
         else:
             # inference mode: compute and return the logits
             logits = self.lm_head(x)
             logits = softcap * torch.tanh(logits / softcap) # logits softcap
+            if return_state:
+                return logits, final_state
             return logits
+
+    def forward_with_recurrence(self, idx, targets=None, loss_reduction='mean'):
+        """
+        Forward pass with recurrent layer state.
+        Performs warmup passes to compute previous token states, then does the real forward pass.
+        """
+        if not self.config.recurrent_layer_state:
+            # Feature disabled, use normal forward
+            return self.forward(idx, targets=targets, loss_reduction=loss_reduction)
+
+        B, T = idx.size()
+        device = idx.device
+
+        # Start with zeros for previous state
+        prev_state = torch.zeros(B, T, self.config.n_embd, dtype=torch.bfloat16, device=device)
+
+        # Perform warmup passes (no gradients)
+        for _ in range(self.config.num_recurrence_warmup):
+            with torch.no_grad():
+                _, warmup_state = self.forward(idx, targets=None, prev_state=prev_state, return_state=True)
+                # Shift: position i gets position i-1's output, position 0 gets zeros
+                prev_state = torch.cat([
+                    torch.zeros(B, 1, self.config.n_embd, dtype=torch.bfloat16, device=device),
+                    warmup_state[:, :-1, :]
+                ], dim=1)
+
+        # Real forward pass with gradients
+        return self.forward(idx, targets=targets, loss_reduction=loss_reduction, prev_state=prev_state, return_state=False)
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
@@ -289,10 +343,37 @@ class GPT(nn.Module):
         if temperature > 0:
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
+
+        # Initial setup
         ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
+        prev_state = None
+
+        # If using recurrent layer state, do warmup passes on the initial prompt
+        if self.config.recurrent_layer_state:
+            T = ids.size(1)
+            prev_state = torch.zeros(1, T, self.config.n_embd, dtype=torch.bfloat16, device=device)
+            for _ in range(self.config.num_recurrence_warmup):
+                _, warmup_state = self.forward(ids, prev_state=prev_state, return_state=True)
+                # Shift: position i gets position i-1's output
+                prev_state = torch.cat([
+                    torch.zeros(1, 1, self.config.n_embd, dtype=torch.bfloat16, device=device),
+                    warmup_state[:, :-1, :]
+                ], dim=1)
+            # Get the last token's state for generation
+            _, final_state = self.forward(ids, prev_state=prev_state, return_state=True)
+            prev_state = final_state[:, -1:, :]  # (1, 1, n_embd)
+
         for _ in range(max_tokens):
-            logits = self.forward(ids) # (B, T, vocab_size)
-            logits = logits[:, -1, :] # (B, vocab_size)
+            if self.config.recurrent_layer_state:
+                # Generate next token with recurrent state
+                next_id = torch.tensor([[ids[0, -1].item()]], dtype=torch.long, device=device)  # Last token as (1, 1)
+                logits, final_state = self.forward(next_id, prev_state=prev_state, return_state=True)  # (1, 1, vocab_size)
+                logits = logits[:, -1, :]  # (1, vocab_size)
+                prev_state = final_state  # Update for next iteration
+            else:
+                logits = self.forward(ids) # (B, T, vocab_size)
+                logits = logits[:, -1, :] # (B, vocab_size)
+
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')

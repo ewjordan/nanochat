@@ -214,7 +214,28 @@ class Engine:
             **kv_model_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+
+        # Handle recurrent layer state during prefill
+        prev_state = None
+        if m.recurrent_layer_state:
+            # Run warmup passes to get initial states
+            T = ids.size(1)
+            prev_state = torch.zeros(1, T, m.n_embd, dtype=torch.bfloat16, device=device)
+            for _ in range(m.num_recurrence_warmup):
+                with torch.no_grad():
+                    _, warmup_state = self.model.forward(ids, kv_cache=None, prev_state=prev_state, return_state=True)
+                    # Shift: position i gets position i-1's output
+                    prev_state = torch.cat([
+                        torch.zeros(1, 1, m.n_embd, dtype=torch.bfloat16, device=device),
+                        warmup_state[:, :-1, :]
+                    ], dim=1)
+            # Now do the real forward pass with KV cache
+            logits, final_state = self.model.forward(ids, kv_cache=kv_cache_prefill, prev_state=prev_state, return_state=True)
+            # Keep the last token's state for the next generation step
+            prev_state = final_state[:, -1:, :]  # (1, 1, n_embd)
+        else:
+            logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+
         logits = logits[:, -1, :]
         next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
         sampled_tokens = next_ids[:, 0].tolist()
@@ -228,6 +249,10 @@ class Engine:
         )
         kv_cache_decode.prefill(kv_cache_prefill)
         del kv_cache_prefill # no need to keep this memory around
+
+        # Replicate prev_state for each sample if using recurrent layer state
+        if m.recurrent_layer_state and prev_state is not None:
+            prev_state = prev_state.expand(num_samples, -1, -1).contiguous()  # (num_samples, 1, n_embd)
 
         # 3) Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
@@ -251,7 +276,11 @@ class Engine:
                 first_iteration = False
             else:
                 # Forward the model and get the next token for each row
-                logits = self.model.forward(ids, kv_cache=kv_cache_decode)  # (B, T, vocab_size)
+                if m.recurrent_layer_state:
+                    logits, final_state = self.model.forward(ids, kv_cache=kv_cache_decode, prev_state=prev_state, return_state=True)  # (B, T, vocab_size)
+                    prev_state = final_state  # Update prev_state for next iteration
+                else:
+                    logits = self.model.forward(ids, kv_cache=kv_cache_decode)  # (B, T, vocab_size)
                 logits = logits[:, -1, :]  # (B, vocab_size) at last time step
                 next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
                 sampled_tokens = next_ids[:, 0].tolist()
