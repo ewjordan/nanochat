@@ -23,8 +23,8 @@ DEPTH=12          # ~186M params (12 layers, 768 dim)
 MAX_SEQ_LEN=512
 
 # RLS needs less memory than baseline due to warmup overhead
-DEVICE_BATCH_RLS=96
-TOTAL_BATCH_RLS=49152  # 96 * 512
+DEVICE_BATCH_RLS=64
+TOTAL_BATCH_RLS=32768  # 64 * 512
 
 # Baseline can use full batch size
 DEVICE_BATCH_BASELINE=128
