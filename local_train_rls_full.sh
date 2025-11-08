@@ -21,14 +21,14 @@ NUM_SHARDS=4    # Change to 71 for Chinchilla optimal
 # Model configuration
 DEPTH=12          # ~186M params (12 layers, 768 dim)
 MAX_SEQ_LEN=512
-DEVICE_BATCH=1
-TOTAL_BATCH=512
+DEVICE_BATCH=32
+TOTAL_BATCH=16384
 
 # Calculate number of iterations for full epoch
 # Each shard has ~250M chars, compression ~4.8 chars/token
 TOKENS_PER_SHARD=$((250000000 / 5))  # ~50M tokens per shard (conservative estimate)
 TOTAL_TOKENS=$((NUM_SHARDS * TOKENS_PER_SHARD))
-NUM_ITERS=$((TOTAL_TOKENS / MAX_SEQ_LEN))
+NUM_ITERS=$((TOTAL_TOKENS / TOTAL_BATCH))
 
 echo "Configuration:"
 echo "  Data shards: $NUM_SHARDS"
