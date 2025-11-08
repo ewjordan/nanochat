@@ -55,7 +55,6 @@ echo ""
 
 # Create output directory
 mkdir -p local_rls_experiments
-cd local_rls_experiments
 
 echo "=========================================="
 echo "RUN 1: Baseline (no RLS)"
@@ -73,7 +72,7 @@ python -m scripts.base_train \
     --eval_every=-1 \
     --core_metric_every=-1 \
     --sample_every=-1 \
-    2>&1 | tee baseline.log
+    2>&1 | tee local_rls_experiments/baseline.log
 
 echo ""
 echo "✓ Baseline complete!"
@@ -96,7 +95,7 @@ python -m scripts.base_train \
     --eval_every=-1 \
     --core_metric_every=-1 \
     --sample_every=-1 \
-    2>&1 | tee rls.log
+    2>&1 | tee local_rls_experiments/rls.log
 
 echo ""
 echo "✓ RLS complete!"
@@ -112,16 +111,16 @@ echo "Extracting final losses..."
 echo ""
 
 echo "--- BASELINE ---"
-grep "step.*train loss" baseline.log | tail -10
+grep "step.*train loss" local_rls_experiments/baseline.log | tail -10
 echo ""
 
 echo "--- RLS ---"
-grep "step.*train loss" rls.log | tail -10
+grep "step.*train loss" local_rls_experiments/rls.log | tail -10
 echo ""
 
 # Extract final loss values
-BASELINE_LOSS=$(grep "step.*train loss" baseline.log | tail -1 | grep -oE "train loss [0-9]+\.[0-9]+" | awk '{print $3}')
-RLS_LOSS=$(grep "step.*train loss" rls.log | tail -1 | grep -oE "train loss [0-9]+\.[0-9]+" | awk '{print $3}')
+BASELINE_LOSS=$(grep "step.*train loss" local_rls_experiments/baseline.log | tail -1 | grep -oE "train loss [0-9]+\.[0-9]+" | awk '{print $3}')
+RLS_LOSS=$(grep "step.*train loss" local_rls_experiments/rls.log | tail -1 | grep -oE "train loss [0-9]+\.[0-9]+" | awk '{print $3}')
 
 echo "=========================================="
 echo "SUMMARY"
