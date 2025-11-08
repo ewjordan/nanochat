@@ -21,23 +21,37 @@ NUM_SHARDS=4    # Change to 71 for Chinchilla optimal
 # Model configuration
 DEPTH=12          # ~186M params (12 layers, 768 dim)
 MAX_SEQ_LEN=512
-DEVICE_BATCH=128
-TOTAL_BATCH=65536
 
-# Calculate number of iterations for full epoch
+# RLS needs less memory than baseline due to warmup overhead
+DEVICE_BATCH_RLS=96
+TOTAL_BATCH_RLS=49152  # 96 * 512
+
+# Baseline can use full batch size
+DEVICE_BATCH_BASELINE=128
+TOTAL_BATCH_BASELINE=65536  # 128 * 512
+
+# Calculate number of iterations for full epoch (use baseline batch for consistency)
 # Each shard has ~250M chars, compression ~4.8 chars/token
 TOKENS_PER_SHARD=$((250000000 / 5))  # ~50M tokens per shard (conservative estimate)
 TOTAL_TOKENS=$((NUM_SHARDS * TOKENS_PER_SHARD))
-NUM_ITERS=$((TOTAL_TOKENS / TOTAL_BATCH))
+NUM_ITERS_RLS=$((TOTAL_TOKENS / TOTAL_BATCH_RLS))
+NUM_ITERS_BASELINE=$((TOTAL_TOKENS / TOTAL_BATCH_BASELINE))
 
 echo "Configuration:"
 echo "  Data shards: $NUM_SHARDS"
 echo "  Total tokens: ~$((TOTAL_TOKENS / 1000000))M"
-echo "  Training iterations: $NUM_ITERS"
 echo "  Depth: $DEPTH (~186M parameters, 12 layers)"
 echo "  Sequence length: $MAX_SEQ_LEN"
-echo "  Device batch size: $DEVICE_BATCH"
-echo "  Total batch size: $TOTAL_BATCH tokens"
+echo ""
+echo "  RLS run:"
+echo "    Device batch size: $DEVICE_BATCH_RLS"
+echo "    Total batch size: $TOTAL_BATCH_RLS tokens"
+echo "    Training iterations: $NUM_ITERS_RLS"
+echo ""
+echo "  Baseline run:"
+echo "    Device batch size: $DEVICE_BATCH_BASELINE"
+echo "    Total batch size: $TOTAL_BATCH_BASELINE tokens"
+echo "    Training iterations: $NUM_ITERS_BASELINE"
 if [ "$NUM_SHARDS" -eq 4 ]; then
     echo "  Training regime: Full epoch (1 pass through data)"
     echo "  Estimated time: ~31 hours on M4 Mac, ~46 min on H100"
@@ -90,9 +104,9 @@ echo ""
 if ! python -u -m scripts.base_train \
     --depth=$DEPTH \
     --max_seq_len=$MAX_SEQ_LEN \
-    --device_batch_size=$DEVICE_BATCH \
-    --total_batch_size=$TOTAL_BATCH \
-    --num_iterations=$NUM_ITERS \
+    --device_batch_size=$DEVICE_BATCH_RLS \
+    --total_batch_size=$TOTAL_BATCH_RLS \
+    --num_iterations=$NUM_ITERS_RLS \
     --recurrent_layer_state=True \
     --num_recurrence_warmup=1 \
     --tokenizer_threads=1 \
@@ -120,9 +134,9 @@ echo ""
 if ! python -u -m scripts.base_train \
     --depth=$DEPTH \
     --max_seq_len=$MAX_SEQ_LEN \
-    --device_batch_size=$DEVICE_BATCH \
-    --total_batch_size=$TOTAL_BATCH \
-    --num_iterations=$NUM_ITERS \
+    --device_batch_size=$DEVICE_BATCH_BASELINE \
+    --total_batch_size=$TOTAL_BATCH_BASELINE \
+    --num_iterations=$NUM_ITERS_BASELINE \
     --recurrent_layer_state=False \
     --tokenizer_threads=1 \
     --eval_every=-1 \
