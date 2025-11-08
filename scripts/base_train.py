@@ -82,7 +82,9 @@ use_dummy_wandb = run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run, config=user_config)
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
+print0("Loading tokenizer...")
 tokenizer = get_tokenizer()
+print0("Loading token bytes...")
 token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
@@ -108,13 +110,18 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
+print0("Creating model config...")
 model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, recurrent_layer_state=recurrent_layer_state, num_recurrence_warmup=num_recurrence_warmup)
+print0("Initializing model on meta device...")
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
     model = GPT(model_config)
+print0(f"Moving model to {device}...")
 model.to_empty(device=device)
+print0("Initializing weights...")
 model.init_weights()
 orig_model = model # original, uncompiled model, for saving raw model state_dict
+print0("Compiling model (this may take a few minutes on first run)...")
 model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
@@ -143,15 +150,20 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
+print0("Setting up optimizers...")
 optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
 adamw_optimizer, muon_optimizer = optimizers
 
 # Initialize the DataLoaders for train/val
+print0("Initializing data loaders...")
 base_dir = get_base_dir()
 tokens_dir = os.path.join(base_dir, "tokenized_data")
+print0(f"Creating train loader (tokenizer_threads={tokenizer_threads})...")
 train_loader = tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="train", tokenizer_threads=tokenizer_threads, device=device)
 build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="val", tokenizer_threads=tokenizer_threads, device=device)
+print0("Loading first batch of data (this may take a minute)...")
 x, y = next(train_loader) # kick off load of the very first batch of data
+print0("First batch loaded successfully!")
 
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
