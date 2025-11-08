@@ -21,8 +21,8 @@ NUM_SHARDS=4    # Change to 71 for Chinchilla optimal
 # Model configuration
 DEPTH=12          # ~186M params (12 layers, 768 dim)
 MAX_SEQ_LEN=512
-DEVICE_BATCH=32
-TOTAL_BATCH=16384
+DEVICE_BATCH=128
+TOTAL_BATCH=65536
 
 # Calculate number of iterations for full epoch
 # Each shard has ~250M chars, compression ~4.8 chars/token
