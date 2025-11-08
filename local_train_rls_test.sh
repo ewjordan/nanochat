@@ -40,19 +40,19 @@ fi
 echo ""
 
 # Configuration - tuned for M4 Mac
-DEPTH=6           # ~7M params
+DEPTH=12          # ~186M params (12 layers, 768 dim)
 MAX_SEQ_LEN=512   # Shorter for memory
 DEVICE_BATCH=1    # Single sequence at a time
 TOTAL_BATCH=512   # Small total batch
-NUM_ITERS=200     # Quick but meaningful
+NUM_ITERS=10000   # Much better signal for RLS comparison
 
 echo "Configuration:"
-echo "  Depth: $DEPTH (~7M parameters)"
+echo "  Depth: $DEPTH (~186M parameters, 12 layers)"
 echo "  Sequence length: $MAX_SEQ_LEN"
 echo "  Device batch size: $DEVICE_BATCH"
 echo "  Total batch size: $TOTAL_BATCH tokens"
 echo "  Training iterations: $NUM_ITERS"
-echo "  Estimated time: 30-60 minutes total"
+echo "  Estimated time: ~2 hours total"
 echo ""
 
 # Create output directory
@@ -74,7 +74,8 @@ if ! python -u -m scripts.base_train \
     --tokenizer_threads=1 \
     --eval_every=-1 \
     --core_metric_every=-1 \
-    --sample_every=-1 \
+    --sample_every=1000 \
+    --log_every=10 \
     2>&1 | tee local_rls_experiments/baseline.log; then
     echo ""
     echo "❌ ERROR: Baseline training failed!"
@@ -103,7 +104,8 @@ if ! python -u -m scripts.base_train \
     --tokenizer_threads=1 \
     --eval_every=-1 \
     --core_metric_every=-1 \
-    --sample_every=-1 \
+    --sample_every=1000 \
+    --log_every=10 \
     2>&1 | tee local_rls_experiments/rls.log; then
     echo ""
     echo "❌ ERROR: RLS training failed!"
