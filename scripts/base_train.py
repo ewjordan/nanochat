@@ -76,19 +76,21 @@ import sys
 print(f"DEBUG [raw print]: After compute_init, device={device}, device_type={device_type}", flush=True)
 print0(f"DEBUG: After compute_init, device={device}, device_type={device_type}")
 sys.stdout.flush()
+print("DEBUG: About to set master_process...", flush=True)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-print0(f"DEBUG: Setting up autocast context...")
+print(f"DEBUG: master_process={master_process}", flush=True)
+print("DEBUG: Setting up autocast context...", flush=True)
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
-print0(f"DEBUG: Setting up synchronize...")
+print("DEBUG: Setting up synchronize...", flush=True)
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-print0(f"DEBUG: Setting up get_max_memory...")
+print("DEBUG: Setting up get_max_memory...", flush=True)
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 
-print0(f"DEBUG: Initializing wandb (use_dummy={run == 'dummy'})...")
+print(f"DEBUG: Initializing wandb (use_dummy={run == 'dummy'})...", flush=True)
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run, config=user_config)
-print0(f"DEBUG: Wandb initialized")
+print("DEBUG: Wandb initialized", flush=True)
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
 print0("Loading tokenizer...")
