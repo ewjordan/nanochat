@@ -82,36 +82,7 @@ echo ""
 mkdir -p local_rls_experiments_full
 
 echo "=========================================="
-echo "RUN 1: Baseline (no RLS)"
-echo "=========================================="
-date
-echo ""
-
-if ! python -u -m scripts.base_train \
-    --depth=$DEPTH \
-    --max_seq_len=$MAX_SEQ_LEN \
-    --device_batch_size=$DEVICE_BATCH \
-    --total_batch_size=$TOTAL_BATCH \
-    --num_iterations=$NUM_ITERS \
-    --recurrent_layer_state=False \
-    --tokenizer_threads=1 \
-    --eval_every=-1 \
-    --core_metric_every=-1 \
-    --sample_every=10000 \
-    --log_every=100 \
-    2>&1 | tee local_rls_experiments_full/baseline.log; then
-    echo ""
-    echo "❌ ERROR: Baseline training failed!"
-    echo "Check local_rls_experiments_full/baseline.log for details"
-    exit 1
-fi
-
-echo ""
-echo "✓ Baseline complete!"
-echo ""
-
-echo "=========================================="
-echo "RUN 2: With Recurrent Layer State"
+echo "RUN 1: With Recurrent Layer State"
 echo "=========================================="
 date
 echo ""
@@ -138,6 +109,35 @@ fi
 
 echo ""
 echo "✓ RLS complete!"
+echo ""
+
+echo "=========================================="
+echo "RUN 2: Baseline (no RLS)"
+echo "=========================================="
+date
+echo ""
+
+if ! python -u -m scripts.base_train \
+    --depth=$DEPTH \
+    --max_seq_len=$MAX_SEQ_LEN \
+    --device_batch_size=$DEVICE_BATCH \
+    --total_batch_size=$TOTAL_BATCH \
+    --num_iterations=$NUM_ITERS \
+    --recurrent_layer_state=False \
+    --tokenizer_threads=1 \
+    --eval_every=-1 \
+    --core_metric_every=-1 \
+    --sample_every=10000 \
+    --log_every=100 \
+    2>&1 | tee local_rls_experiments_full/baseline.log; then
+    echo ""
+    echo "❌ ERROR: Baseline training failed!"
+    echo "Check local_rls_experiments_full/baseline.log for details"
+    exit 1
+fi
+
+echo ""
+echo "✓ Baseline complete!"
 echo ""
 
 echo "=========================================="
