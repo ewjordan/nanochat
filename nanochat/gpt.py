@@ -285,6 +285,10 @@ class GPT(nn.Module):
         # Capture final state before lm_head
         final_state = x
 
+        # If we only need state, skip expensive lm_head computation
+        if return_state and targets is None:
+            return None, final_state
+
         # Forward the lm_head (compute logits)
         softcap = 15
         if targets is not None:
@@ -321,6 +325,7 @@ class GPT(nn.Module):
         prev_state = torch.zeros(B, T, self.config.n_embd, dtype=torch.bfloat16, device=device)
 
         # Perform warmup passes (no gradients)
+        # Note: forward() will skip lm_head when targets=None and return_state=True
         for _ in range(self.config.num_recurrence_warmup):
             with torch.no_grad():
                 _, warmup_state = self.forward(idx, targets=None, prev_state=prev_state, return_state=True)
