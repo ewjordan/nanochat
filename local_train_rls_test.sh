@@ -71,6 +71,7 @@ if ! python -m scripts.base_train \
     --total_batch_size=$TOTAL_BATCH \
     --num_iterations=$NUM_ITERS \
     --recurrent_layer_state=False \
+    --tokenizer_threads=1 \
     --eval_every=-1 \
     --core_metric_every=-1 \
     --sample_every=-1 \
@@ -99,6 +100,7 @@ if ! python -m scripts.base_train \
     --num_iterations=$NUM_ITERS \
     --recurrent_layer_state=True \
     --num_recurrence_warmup=1 \
+    --tokenizer_threads=1 \
     --eval_every=-1 \
     --core_metric_every=-1 \
     --sample_every=-1 \
