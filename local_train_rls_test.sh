@@ -3,7 +3,9 @@
 # Local RLS validation run on M4 Mac
 # Based on dev/runcpu.sh but compares baseline vs RLS
 
-set -e
+set -e          # Exit on error
+set -o pipefail # Catch errors in pipes
+set -u          # Error on undefined variables
 
 echo "=========================================="
 echo "Local RLS Validation Run (M4 Mac)"
@@ -62,7 +64,7 @@ echo "=========================================="
 date
 echo ""
 
-python -m scripts.base_train \
+if ! python -m scripts.base_train \
     --depth=$DEPTH \
     --max_seq_len=$MAX_SEQ_LEN \
     --device_batch_size=$DEVICE_BATCH \
@@ -72,7 +74,12 @@ python -m scripts.base_train \
     --eval_every=-1 \
     --core_metric_every=-1 \
     --sample_every=-1 \
-    2>&1 | tee local_rls_experiments/baseline.log
+    2>&1 | tee local_rls_experiments/baseline.log; then
+    echo ""
+    echo "❌ ERROR: Baseline training failed!"
+    echo "Check local_rls_experiments/baseline.log for details"
+    exit 1
+fi
 
 echo ""
 echo "✓ Baseline complete!"
@@ -84,7 +91,7 @@ echo "=========================================="
 date
 echo ""
 
-python -m scripts.base_train \
+if ! python -m scripts.base_train \
     --depth=$DEPTH \
     --max_seq_len=$MAX_SEQ_LEN \
     --device_batch_size=$DEVICE_BATCH \
@@ -95,7 +102,12 @@ python -m scripts.base_train \
     --eval_every=-1 \
     --core_metric_every=-1 \
     --sample_every=-1 \
-    2>&1 | tee local_rls_experiments/rls.log
+    2>&1 | tee local_rls_experiments/rls.log; then
+    echo ""
+    echo "❌ ERROR: RLS training failed!"
+    echo "Check local_rls_experiments/rls.log for details"
+    exit 1
+fi
 
 echo ""
 echo "✓ RLS complete!"
