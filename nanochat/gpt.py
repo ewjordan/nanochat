@@ -322,11 +322,6 @@ class GPT(nn.Module):
         B, T = idx.size()
         device = idx.device
 
-        # Memory debug
-        if torch.cuda.is_available():
-            mem_before = torch.cuda.memory_allocated() / 1024**3
-            print(f"[RLS] Memory before warmup: {mem_before:.2f} GB")
-
         # Start with zeros for previous state
         prev_state = torch.zeros(B, T, self.config.n_embd, dtype=torch.bfloat16, device=device)
 
@@ -340,16 +335,6 @@ class GPT(nn.Module):
                     torch.zeros(B, 1, self.config.n_embd, dtype=torch.bfloat16, device=device),
                     warmup_state[:, :-1, :]
                 ], dim=1)
-                del warmup_state  # Explicitly delete
-            if torch.cuda.is_available():
-                mem_after_warmup = torch.cuda.memory_allocated() / 1024**3
-                print(f"[RLS] Memory after warmup {i}: {mem_after_warmup:.2f} GB")
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            mem_after_cache_clear = torch.cuda.memory_allocated() / 1024**3
-            print(f"[RLS] Memory after cache clear: {mem_after_cache_clear:.2f} GB")
-            print(f"[RLS] prev_state size: {prev_state.numel() * prev_state.element_size() / 1024**2:.2f} MB")
 
         # Real forward pass with gradients
         return self.forward(idx, targets=targets, loss_reduction=loss_reduction, prev_state=prev_state, return_state=False)
