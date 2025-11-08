@@ -28,6 +28,8 @@ class DistAdamW(torch.optim.Optimizer):
             params: list[Tensor] = group["params"]
             for base_i in range(len(params)):
                 grad = params[base_i].grad
+                if grad is None:
+                    continue  # Skip parameters without gradients
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
                 reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
@@ -40,8 +42,10 @@ class DistAdamW(torch.optim.Optimizer):
             wd = group['weight_decay']
             params = group['params']
             for base in range(len(params)):
-                reduce_scatter_futures[idx].wait()
                 p = params[base]
+                if p.grad is None:
+                    continue  # Skip parameters without gradients
+                reduce_scatter_futures[idx].wait()
                 rank_size = p.shape[0] // world_size
                 p_slice = p[rank * rank_size:(rank + 1) * rank_size]
                 lr = group['lr'] * getattr(p, "lr_mul", 1.0)
