@@ -198,7 +198,7 @@ for step in range(num_iterations + 1):
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if last_step or step % eval_every == 0:
+    if last_step or (eval_every > 0 and step % eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
@@ -233,7 +233,7 @@ for step in range(num_iterations + 1):
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
-    if master_process and (last_step or (step > 0 and step % sample_every == 0)):
+    if master_process and (last_step or (sample_every > 0 and step > 0 and step % sample_every == 0)):
         model.eval()
         prompts = [
             "The capital of France is",
