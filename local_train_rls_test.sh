@@ -64,7 +64,7 @@ echo "=========================================="
 date
 echo ""
 
-if ! python -m scripts.base_train \
+if ! python -u -m scripts.base_train \
     --depth=$DEPTH \
     --max_seq_len=$MAX_SEQ_LEN \
     --device_batch_size=$DEVICE_BATCH \
@@ -92,7 +92,7 @@ echo "=========================================="
 date
 echo ""
 
-if ! python -m scripts.base_train \
+if ! python -u -m scripts.base_train \
     --depth=$DEPTH \
     --max_seq_len=$MAX_SEQ_LEN \
     --device_batch_size=$DEVICE_BATCH \
