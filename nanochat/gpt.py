@@ -169,9 +169,13 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-        # zero out state_gate weights (start with pass-through behavior)
+        # Initialize state_gate to pass through token embeddings, ignore prev_state initially
         if self.state_gate is not None:
-            torch.nn.init.zeros_(self.state_gate.weight)
+            with torch.no_grad():
+                # First n_embd columns: identity matrix (passes through token embedding)
+                self.state_gate.weight[:, :self.config.n_embd] = torch.eye(self.config.n_embd)
+                # Last n_embd columns: zeros (ignores prev_state initially)
+                self.state_gate.weight[:, self.config.n_embd:] = 0.0
         # init the rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
