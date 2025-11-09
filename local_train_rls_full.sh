@@ -30,10 +30,11 @@ NUM_SHARDS=4    # Change to 71 for Chinchilla optimal
 DEPTH=12          # ~186M params (12 layers, 768 dim)
 MAX_SEQ_LEN=512
 
+# H100-optimized batch sizes
 # Use same batch size for both runs for fair comparison
 # Batch size affects optimization dynamics, so we need apples-to-apples
-DEVICE_BATCH=64
-TOTAL_BATCH=32768  # 64 * 512
+DEVICE_BATCH=256   # H100 can handle much larger batches than M4 Mac
+TOTAL_BATCH=131072  # 256 * 512 (single gradient accumulation step)
 
 # Calculate number of iterations for full epoch
 # Each shard has ~250M chars, compression ~4.8 chars/token
@@ -51,10 +52,10 @@ echo "  Device batch size: $DEVICE_BATCH"
 echo "  Total batch size: $TOTAL_BATCH tokens"
 if [ "$NUM_SHARDS" -eq 4 ]; then
     echo "  Training regime: Full epoch (1 pass through data)"
-    echo "  Estimated time: ~31 hours on M4 Mac, ~46 min on H100"
+    echo "  Estimated time: ~12 min on H100 (batch_size=256)"
 else
     echo "  Training regime: Chinchilla optimal"
-    echo "  Estimated time: ~13.5 hours on H100"
+    echo "  Estimated time: ~3.5 hours on H100 (batch_size=256)"
 fi
 echo ""
 
