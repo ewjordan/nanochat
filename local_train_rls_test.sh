@@ -2,6 +2,8 @@
 
 # Local RLS validation run on M4 Mac
 # Based on dev/runcpu.sh but compares baseline vs RLS
+# Usage: bash local_train_rls_test.sh [num_iterations]
+#   num_iterations: number of training iterations (default: 1000)
 
 set -e          # Exit on error
 set -o pipefail # Catch errors in pipes
@@ -44,7 +46,7 @@ DEPTH=12          # ~186M params (12 layers, 768 dim)
 MAX_SEQ_LEN=512   # Shorter for memory
 DEVICE_BATCH=1    # Single sequence at a time
 TOTAL_BATCH=512   # Small total batch
-NUM_ITERS=1000   # Much better signal for RLS comparison
+NUM_ITERS=${1:-1000}   # Default to 1000 if not provided
 
 echo "Configuration:"
 echo "  Depth: $DEPTH (~186M parameters, 12 layers)"
@@ -52,7 +54,11 @@ echo "  Sequence length: $MAX_SEQ_LEN"
 echo "  Device batch size: $DEVICE_BATCH"
 echo "  Total batch size: $TOTAL_BATCH tokens"
 echo "  Training iterations: $NUM_ITERS"
-echo "  Estimated time: ~2 hours total"
+if [ $NUM_ITERS -ge 1000 ]; then
+    echo "  Estimated time: ~2 hours total"
+else
+    echo "  Estimated time: ~$((NUM_ITERS * 120 / 1000)) minutes total"
+fi
 echo ""
 
 # Create output directory
