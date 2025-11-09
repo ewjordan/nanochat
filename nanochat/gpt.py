@@ -300,10 +300,13 @@ class GPT(nn.Module):
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into groups (matrix, embedding, lm_head, state_gate)
+        # Separate out all parameters into groups (matrix, embedding, lm_head, RLS components)
         matrix_params = list(self.transformer.h.parameters())
-        if self.state_gate is not None:
-            matrix_params.extend(list(self.state_gate.parameters()))
+        # Add RLS components (side_mlp, type embeddings) to matrix params for Muon optimizer
+        if self.config.recurrent_layer_state:
+            matrix_params.extend(list(self.side_mlp.parameters()))
+            matrix_params.append(self.E_type_main)
+            matrix_params.append(self.E_type_side)
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
