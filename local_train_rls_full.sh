@@ -2,6 +2,11 @@
 
 # Full epoch RLS validation run
 # This script trains to completion using all available data
+#
+# Weights & Biases integration:
+#   - Automatically logs both runs to W&B (if wandb is configured)
+#   - Run names: rls-side-tokens-{timestamp} and baseline-{timestamp}
+#   - Set WANDB_DISABLE=1 to disable wandb logging
 
 set -e          # Exit on error
 set -o pipefail # Catch errors in pipes
@@ -11,6 +16,9 @@ echo "=========================================="
 echo "Full Epoch RLS Validation"
 echo "=========================================="
 echo ""
+
+# Generate unique identifier for this experiment run
+RUN_ID=$(date +%Y%m%d-%H%M%S)
 
 # Configuration options
 # Set NUM_SHARDS to control training length:
@@ -90,6 +98,11 @@ echo "=========================================="
 date
 echo ""
 
+# Set wandb run name for RLS training
+export WANDB_RUN="rls-side-tokens-d${DEPTH}-${RUN_ID}"
+echo "W&B Run: $WANDB_RUN"
+echo ""
+
 if ! python -u -m scripts.base_train \
     --depth=$DEPTH \
     --max_seq_len=$MAX_SEQ_LEN \
@@ -118,6 +131,11 @@ echo "=========================================="
 echo "RUN 2: Baseline (no RLS)"
 echo "=========================================="
 date
+echo ""
+
+# Set wandb run name for baseline training
+export WANDB_RUN="baseline-d${DEPTH}-${RUN_ID}"
+echo "W&B Run: $WANDB_RUN"
 echo ""
 
 if ! python -u -m scripts.base_train \
