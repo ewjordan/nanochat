@@ -65,49 +65,117 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x, cos_sin, kv_cache, prev_state=None, rls_components=None):
         B, T, C = x.size()
 
-        # Project the input to get queries, keys, and values
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        # Layer 0 with RLS: dual-stream attention (main tokens + side tokens from prev_state)
+        if self.layer_idx == 0 and prev_state is not None and rls_components is not None:
+            # Unpack RLS components
+            E_type_main, E_type_side, side_mlp = rls_components
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
-        q, k = norm(q), norm(k) # QK norm
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
+            # Compute side embeddings from prev_state using side MLP
+            s = side_mlp(prev_state)  # (B, T, n_embd)
 
-        # Apply KV cache: insert current k,v into cache, get the full view so far
-        if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-        Tq = q.size(2) # number of queries in this forward pass
-        Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
+            # Add type embeddings to distinguish main vs side streams
+            h_main = x + E_type_main  # (B, T, n_embd)
+            h_side = s + E_type_side  # (B, T, n_embd)
 
-        # Attention: queries attend to keys/values autoregressively. A few cases to handle:
-        enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
-        if kv_cache is None or Tq == Tk:
-            # During training (no KV cache), attend as usual with causal attention
-            # And even if there is KV cache, we can still use this simple version when Tq == Tk
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-        elif Tq == 1:
-            # During inference but with a single query in this forward pass:
-            # The query has to attend to all the keys/values in the cache
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+            # Project queries (only from main stream - side tokens never query)
+            q = self.c_q(h_main).view(B, T, self.n_head, self.head_dim)
+
+            # Project keys and values for BOTH streams
+            k_main = self.c_k(h_main).view(B, T, self.n_kv_head, self.head_dim)
+            v_main = self.c_v(h_main).view(B, T, self.n_kv_head, self.head_dim)
+            k_side = self.c_k(h_side).view(B, T, self.n_kv_head, self.head_dim)
+            v_side = self.c_v(h_side).view(B, T, self.n_kv_head, self.head_dim)
+
+            # Apply RoPE to q and both k streams (same position indices)
+            cos, sin = cos_sin
+            q = apply_rotary_emb(q, cos, sin)
+            k_main = apply_rotary_emb(k_main, cos, sin)
+            k_side = apply_rotary_emb(k_side, cos, sin)
+
+            # QK norm
+            q, k_main, k_side = norm(q), norm(k_main), norm(k_side)
+
+            # Transpose to (B, H, T, D)
+            q = q.transpose(1, 2)
+            k_main = k_main.transpose(1, 2)
+            v_main = v_main.transpose(1, 2)
+            k_side = k_side.transpose(1, 2)
+            v_side = v_side.transpose(1, 2)
+
+            # Concatenate main and side K/V along sequence dimension
+            k = torch.cat([k_main, k_side], dim=2)  # (B, H, 2T, D)
+            v = torch.cat([v_main, v_side], dim=2)  # (B, H, 2T, D)
+
+            # Handle KV cache for layer 0 (stores 2T positions)
+            if kv_cache is not None:
+                k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+
+            Tq = q.size(2)  # number of queries
+            Tk_total = k.size(2)  # total K/V length (2T for dual-stream)
+            Tk = Tk_total // 2  # main stream length
+
+            # Build causal mask [Tq, 2*Tk]: queries attend to both main and side causally
+            enable_gqa = self.n_head != self.n_kv_head
+            if kv_cache is None or Tq == Tk:
+                # Training: causal mask for 2T
+                mask_main = torch.tril(torch.ones(Tq, Tk, dtype=torch.bool, device=q.device))
+                mask_side = torch.tril(torch.ones(Tq, Tk, dtype=torch.bool, device=q.device))
+                attn_mask = torch.cat([mask_main, mask_side], dim=1)  # (Tq, 2*Tk)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+            elif Tq == 1:
+                # Single token inference: attend to all cached main and side tokens
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+            else:
+                # Chunk inference: attend to full prefix + causal within chunk (for both streams)
+                attn_mask = torch.zeros((Tq, Tk_total), dtype=torch.bool, device=q.device)
+                prefix_len = Tk - Tq
+                # Main stream
+                if prefix_len > 0:
+                    attn_mask[:, :prefix_len] = True  # Attend to main prefix
+                attn_mask[:, prefix_len:Tk] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))  # Causal main
+                # Side stream (same pattern, offset by Tk)
+                if prefix_len > 0:
+                    attn_mask[:, Tk:Tk+prefix_len] = True  # Attend to side prefix
+                attn_mask[:, Tk+prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))  # Causal side
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+
         else:
-            # During inference AND we have a chunk of queries in this forward pass:
-            # First, each query attends to all the cached keys/values (i.e. full prefix)
-            attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device) # True = keep, False = mask
-            prefix_len = Tk - Tq
-            if prefix_len > 0: # can't be negative but could be zero
-                attn_mask[:, :prefix_len] = True
-            # Then, causal attention within this chunk
-            attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+            # Normal single-stream attention (higher layers or no prev_state)
+            q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
-        # Re-assemble the heads side by side and project back to residual stream
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+            # Apply Rotary Embeddings to queries and keys
+            cos, sin = cos_sin
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            q, k = norm(q), norm(k)  # QK norm
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+            # Apply KV cache
+            if kv_cache is not None:
+                k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+            Tq = q.size(2)
+            Tk = k.size(2)
+
+            # Standard causal attention
+            enable_gqa = self.n_head != self.n_kv_head
+            if kv_cache is None or Tq == Tk:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+            elif Tq == 1:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+            else:
+                attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device)
+                prefix_len = Tk - Tq
+                if prefix_len > 0:
+                    attn_mask[:, :prefix_len] = True
+                attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+
+        # Re-assemble the heads and project back to residual stream
+        y = y.transpose(1, 2).contiguous().view(B, Tq, -1)
         y = self.c_proj(y)
         return y
 
@@ -131,8 +199,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos_sin, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, kv_cache)
+    def forward(self, x, cos_sin, kv_cache, prev_state=None, rls_components=None):
+        x = x + self.attn(norm(x), cos_sin, kv_cache, prev_state, rls_components)
         x = x + self.mlp(norm(x))
         return x
 
@@ -146,11 +214,21 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # Recurrent layer state gating mechanism
+        # Recurrent layer state: side token architecture
         if config.recurrent_layer_state:
-            self.state_gate = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
+            # Type embeddings to distinguish main vs side token streams
+            self.E_type_main = nn.Parameter(torch.zeros(config.n_embd))
+            self.E_type_side = nn.Parameter(torch.zeros(config.n_embd))
+            # Side MLP: maps prev_state features to side embeddings (2 layers, GELU)
+            self.side_mlp = nn.Sequential(
+                nn.Linear(config.n_embd, config.n_embd, bias=False),
+                nn.GELU(),
+                nn.Linear(config.n_embd, config.n_embd, bias=False)
+            )
         else:
-            self.state_gate = None
+            self.E_type_main = None
+            self.E_type_side = None
+            self.side_mlp = None
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
@@ -169,13 +247,8 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-        # Initialize state_gate to pass through token embeddings, ignore prev_state initially
-        if self.state_gate is not None:
-            with torch.no_grad():
-                # First n_embd columns: identity matrix (passes through token embedding)
-                self.state_gate.weight[:, :self.config.n_embd] = torch.eye(self.config.n_embd)
-                # Last n_embd columns: zeros (ignores prev_state initially)
-                self.state_gate.weight[:, self.config.n_embd:] = 0.0
+        # Initialize side MLP (already handled by _init_weights for Linear layers)
+        # Type embeddings initialized to zeros (already done in __init__)
         # init the rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -271,15 +344,22 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
 
-        # Mix with previous token's final layer state if provided
-        if prev_state is not None and self.state_gate is not None:
-            # Concatenate token embedding and previous state, then apply learned gating
-            gate_input = torch.cat([x, prev_state], dim=-1)  # (B, T, 2*n_embd)
-            x = self.state_gate(gate_input)  # (B, T, n_embd)
+        # prev_state will be integrated via side tokens in layer 0's attention (if RLS enabled)
+        # No mixing at the input layer - embeddings remain pure
+
+        # Side stream dropout: randomly zero out prev_state during training to maintain base competence
+        if self.training and prev_state is not None and self.config.recurrent_layer_state:
+            drop_mask = (torch.rand(B, 1, 1, device=prev_state.device) > 0.15).to(prev_state.dtype)
+            prev_state = prev_state * drop_mask
+
+        # Pack RLS components for layer 0 (if enabled)
+        rls_components = None
+        if self.config.recurrent_layer_state and prev_state is not None:
+            rls_components = (self.E_type_main, self.E_type_side, self.side_mlp)
 
         x = norm(x)
         for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
+            x = block(x, cos_sin, kv_cache, prev_state=prev_state, rls_components=rls_components)
         x = norm(x)
 
         # Capture final state before lm_head
@@ -322,9 +402,11 @@ class GPT(nn.Module):
 
         B, T = idx.size()
         device = idx.device
+        # Infer dtype from model parameters (bfloat16 on CUDA, float32 on CPU)
+        model_dtype = next(self.parameters()).dtype
 
         # Start with zeros for previous state
-        prev_state = torch.zeros(B, T, self.config.n_embd, dtype=torch.bfloat16, device=device)
+        prev_state = torch.zeros(B, T, self.config.n_embd, dtype=model_dtype, device=device)
 
         # Perform warmup passes (no gradients)
         # Note: forward() will skip lm_head when targets=None and return_state=True
@@ -333,7 +415,7 @@ class GPT(nn.Module):
                 _, warmup_state = self.forward(idx, targets=None, prev_state=prev_state, return_state=True)
                 # Shift: position i gets position i-1's output, position 0 gets zeros
                 prev_state = torch.cat([
-                    torch.zeros(B, 1, self.config.n_embd, dtype=torch.bfloat16, device=device),
+                    torch.zeros(B, 1, self.config.n_embd, dtype=model_dtype, device=device),
                     warmup_state[:, :-1, :]
                 ], dim=1)
 

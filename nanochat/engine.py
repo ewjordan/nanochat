@@ -220,13 +220,15 @@ class Engine:
         if m.recurrent_layer_state:
             # Run warmup passes to get initial states
             T = ids.size(1)
-            prev_state = torch.zeros(1, T, m.n_embd, dtype=torch.bfloat16, device=device)
+            # Infer dtype from model (bfloat16 on CUDA, float32 on CPU)
+            model_dtype = next(self.model.parameters()).dtype
+            prev_state = torch.zeros(1, T, m.n_embd, dtype=model_dtype, device=device)
             for _ in range(m.num_recurrence_warmup):
                 with torch.no_grad():
                     _, warmup_state = self.model.forward(ids, kv_cache=None, prev_state=prev_state, return_state=True)
                     # Shift: position i gets position i-1's output
                     prev_state = torch.cat([
-                        torch.zeros(1, 1, m.n_embd, dtype=torch.bfloat16, device=device),
+                        torch.zeros(1, 1, m.n_embd, dtype=model_dtype, device=device),
                         warmup_state[:, :-1, :]
                     ], dim=1)
             # Now do the real forward pass with KV cache
