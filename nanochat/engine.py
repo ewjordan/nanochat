@@ -85,11 +85,12 @@ class KVCache:
     Note that the .pos advances automatically after the last layer of the Transformer inserts.
     """
 
-    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers):
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, rls_enabled=False):
         # Each of K/V is of shape (B, H, T, D) and we have one per layer of the Transformer.
         self.kv_shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
         self.kv_cache = None
-        self.pos = 0 # current position in time in the cache
+        self.pos = 0 # current position in time in the cache (in terms of real tokens, not cache positions)
+        self.rls_enabled = rls_enabled  # If True, layer 0 uses 2x positions for side tokens
 
     def reset(self):
         self.pos = 0
@@ -106,6 +107,7 @@ class KVCache:
         # 1) validate the shapes
         assert self.kv_cache is None, "Cannot prefill a non-empty KV cache"
         assert other.kv_cache is not None, "Cannot prefill with a None KV cache"
+        assert self.rls_enabled == other.rls_enabled, "RLS enabled mismatch between caches"
         for ix, (dim1, dim2) in enumerate(zip(self.kv_shape, other.kv_shape)):
             if ix in [0, 1, 3, 5]:
                 # num_layers, batch_size, num_heads, head_dim must match
@@ -119,8 +121,16 @@ class KVCache:
         # 2) initialize the cache
         dtype, device = other.kv_cache.dtype, other.kv_cache.device
         self.kv_cache = torch.empty(self.kv_shape, dtype=dtype, device=device)
-        # 3) copy the data over
-        self.kv_cache[:, :, :, :, :other.pos, :] = other.kv_cache
+        # 3) copy the data over (layer 0 with RLS needs 2x positions copied)
+        if self.rls_enabled:
+            # Layer 0: copy 2*pos positions (main + side tokens)
+            self.kv_cache[0, :, :, :, :2*other.pos, :] = other.kv_cache[0, :, :, :, :2*other.pos, :]
+            # Other layers: copy pos positions
+            if self.kv_shape[0] > 1:  # If more than one layer
+                self.kv_cache[1:, :, :, :, :other.pos, :] = other.kv_cache[1:, :, :, :, :other.pos, :]
+        else:
+            # Non-RLS: copy pos positions for all layers
+            self.kv_cache[:, :, :, :, :other.pos, :] = other.kv_cache[:, :, :, :, :other.pos, :]
         # 4) update the pos
         self.pos = other.pos
 
@@ -130,7 +140,11 @@ class KVCache:
             self.kv_cache = torch.empty(self.kv_shape, dtype=k.dtype, device=k.device)
         # Insert new keys/values to the cache and return the full cache so far
         B, H, T_add, D = k.size()
-        t0, t1 = self.pos, self.pos + T_add
+        # Layer 0 with RLS uses 2x positions (main + side tokens)
+        if self.rls_enabled and layer_idx == 0:
+            t0, t1 = 2 * self.pos, 2 * self.pos + T_add
+        else:
+            t0, t1 = self.pos, self.pos + T_add
         # Dynamically grow the cache if needed
         if t1 > self.kv_cache.size(4):
             t_needed = t1 + 1024 # as much as we need plus buffer of 1024
@@ -147,7 +161,11 @@ class KVCache:
         key_view = self.kv_cache[layer_idx, 0, :, :, :t1]
         value_view = self.kv_cache[layer_idx, 1, :, :, :t1]
         # Increment pos after the last layer of the Transformer processes
+        # pos represents number of real tokens, not cache positions
         if layer_idx == self.kv_cache.size(0) - 1:
+            # t1 from the last layer is always correct because:
+            # - Last layer is never layer 0 (assuming multiple layers)
+            # - So t1 = pos + T_add where T_add is the number of real tokens
             self.pos = t1
         return key_view, value_view
 
@@ -207,10 +225,12 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer, "rls_enabled": m.recurrent_layer_state}
+        # If RLS is enabled, layer 0 needs 2x sequence length for side tokens
+        prefill_seq_len = len(tokens) * 2 if m.recurrent_layer_state else len(tokens)
         kv_cache_prefill = KVCache(
             batch_size=1,
-            seq_len=len(tokens),
+            seq_len=prefill_seq_len,
             **kv_model_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
@@ -244,9 +264,11 @@ class Engine:
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+        # If RLS is enabled, layer 0 needs 2x sequence length for side tokens
+        decode_seq_len = kv_length_hint * 2 if m.recurrent_layer_state else kv_length_hint
         kv_cache_decode = KVCache(
             batch_size=num_samples,
-            seq_len=kv_length_hint,
+            seq_len=decode_seq_len,
             **kv_model_kwargs,
         )
         kv_cache_decode.prefill(kv_cache_prefill)
