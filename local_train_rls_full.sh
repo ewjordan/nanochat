@@ -4,9 +4,9 @@
 # This script trains to completion using all available data
 #
 # Weights & Biases integration:
-#   - Automatically logs both runs to W&B (if wandb is configured)
-#   - Run names: rls-side-tokens-{timestamp} and baseline-{timestamp}
-#   - Set WANDB_DISABLE=1 to disable wandb logging
+#   - Automatically logs both runs to W&B (requires 'wandb login' first)
+#   - Run names: rls-side-tokens-d{depth}-{timestamp} and baseline-d{depth}-{timestamp}
+#   - Project: nanochat
 
 set -e          # Exit on error
 set -o pipefail # Catch errors in pipes
@@ -101,8 +101,8 @@ date
 echo ""
 
 # Set wandb run name for RLS training
-export WANDB_RUN="rls-side-tokens-d${DEPTH}-${RUN_ID}"
-echo "W&B Run: $WANDB_RUN"
+RLS_RUN_NAME="rls-side-tokens-d${DEPTH}-${RUN_ID}"
+echo "W&B Run: $RLS_RUN_NAME"
 echo ""
 
 if ! python -u -m scripts.base_train \
@@ -118,6 +118,7 @@ if ! python -u -m scripts.base_train \
     --core_metric_every=-1 \
     --sample_every=10000 \
     --log_every=100 \
+    --run="$RLS_RUN_NAME" \
     2>&1 | tee local_rls_experiments_full/rls.log; then
     echo ""
     echo "❌ ERROR: RLS training failed!"
@@ -136,8 +137,8 @@ date
 echo ""
 
 # Set wandb run name for baseline training
-export WANDB_RUN="baseline-d${DEPTH}-${RUN_ID}"
-echo "W&B Run: $WANDB_RUN"
+BASELINE_RUN_NAME="baseline-d${DEPTH}-${RUN_ID}"
+echo "W&B Run: $BASELINE_RUN_NAME"
 echo ""
 
 if ! python -u -m scripts.base_train \
@@ -152,6 +153,7 @@ if ! python -u -m scripts.base_train \
     --core_metric_every=-1 \
     --sample_every=10000 \
     --log_every=100 \
+    --run="$BASELINE_RUN_NAME" \
     2>&1 | tee local_rls_experiments_full/baseline.log; then
     echo ""
     echo "❌ ERROR: Baseline training failed!"
