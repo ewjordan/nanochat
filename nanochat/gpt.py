@@ -302,14 +302,16 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into groups (matrix, embedding, lm_head, RLS components)
         matrix_params = list(self.transformer.h.parameters())
-        # Add RLS components (side_mlp, type embeddings) to matrix params for Muon optimizer
+        # Add RLS side_mlp to matrix params for Muon optimizer (it's a 2D matrix)
         if self.config.recurrent_layer_state:
             matrix_params.extend(list(self.side_mlp.parameters()))
-            matrix_params.append(self.E_type_main)
-            matrix_params.append(self.E_type_side)
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
+        # Type embeddings are 1D vectors, so they go to AdamW (Muon requires 2D+ matrices)
+        rls_embedding_params = []
+        if self.config.recurrent_layer_state:
+            rls_embedding_params = [self.E_type_main, self.E_type_side]
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(rls_embedding_params)
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -319,6 +321,9 @@ class GPT(nn.Module):
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
         ]
+        # Add RLS type embeddings to AdamW with same LR as regular embeddings
+        if self.config.recurrent_layer_state:
+            adam_groups.append(dict(params=rls_embedding_params, lr=embedding_lr * dmodel_lr_scale))
         adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)

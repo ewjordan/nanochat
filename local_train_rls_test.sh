@@ -44,7 +44,7 @@ DEPTH=12          # ~186M params (12 layers, 768 dim)
 MAX_SEQ_LEN=512   # Shorter for memory
 DEVICE_BATCH=1    # Single sequence at a time
 TOTAL_BATCH=512   # Small total batch
-NUM_ITERS=10000   # Much better signal for RLS comparison
+NUM_ITERS=1000   # Much better signal for RLS comparison
 
 echo "Configuration:"
 echo "  Depth: $DEPTH (~186M parameters, 12 layers)"
