@@ -202,6 +202,16 @@ Current LLM policy: disclosure. When submitting a PR, please declare any parts t
 - Thank you [Lambda](https://lambda.ai/service/gpu-cloud) for the compute used in developing this project.
 - Thank you to chief LLM whisperer 🧙‍♂️ Alec Radford for advice/guidance.
 
+## Dataset browser
+
+Need to peek inside whatever shards you have under `~/.cache/nanochat/base_data`? Fire up the lightweight FastAPI UI:
+
+```bash
+uv run python -m scripts.dataset_browser --host 127.0.0.1 --port 8008
+```
+
+It lists the shards you have locally, shows their row counts and sizes, lets you page through any slice of rows, and includes a substring search so you can quickly inspect how documents look without writing one-off scripts. The UI is self-contained (no external CDN/JS) so it works on air-gapped boxes as long as you can open the printed URL on the same machine.
+
 ## Cite
 
 If you find nanochat helpful in your research cite simply as:
