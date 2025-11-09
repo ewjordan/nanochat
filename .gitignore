@@ -11,4 +11,4 @@ eval_bundle/
 
 # RLS experiment outputs (logs, checkpoints)
 local_rls_experiments/
-local_rls_experiments_full/
+local_rls_experiments_full/*.swp
