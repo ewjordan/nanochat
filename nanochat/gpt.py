@@ -285,8 +285,9 @@ class GPT(nn.Module):
         # Capture final state before lm_head
         final_state = x
 
-        # If we only need state, skip expensive lm_head computation
-        if return_state and targets is None:
+        # If we only need state (warmup mode), skip expensive lm_head computation
+        # Don't skip if kv_cache is provided (generation mode needs logits)
+        if return_state and targets is None and kv_cache is None:
             return None, final_state
 
         # Forward the lm_head (compute logits)
