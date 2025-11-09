@@ -33,8 +33,9 @@ MAX_SEQ_LEN=512
 # H100-optimized batch sizes
 # Use same batch size for both runs for fair comparison
 # Batch size affects optimization dynamics, so we need apples-to-apples
-DEVICE_BATCH=256   # H100 can handle much larger batches than M4 Mac
-TOTAL_BATCH=131072  # 256 * 512 (single gradient accumulation step)
+# RLS layer-0 uses 2x memory (T×2T attention), so we reduce from 256→128
+DEVICE_BATCH=128   # Fits both baseline and RLS comfortably
+TOTAL_BATCH=65536   # 128 * 512 (single gradient accumulation step)
 
 # Calculate number of iterations for full epoch
 # Each shard has ~250M chars, compression ~4.8 chars/token
@@ -52,10 +53,10 @@ echo "  Device batch size: $DEVICE_BATCH"
 echo "  Total batch size: $TOTAL_BATCH tokens"
 if [ "$NUM_SHARDS" -eq 4 ]; then
     echo "  Training regime: Full epoch (1 pass through data)"
-    echo "  Estimated time: ~12 min on H100 (batch_size=256)"
+    echo "  Estimated time: ~25 min on H100 (batch_size=128)"
 else
     echo "  Training regime: Chinchilla optimal"
-    echo "  Estimated time: ~3.5 hours on H100 (batch_size=256)"
+    echo "  Estimated time: ~7 hours on H100 (batch_size=128)"
 fi
 echo ""
 
