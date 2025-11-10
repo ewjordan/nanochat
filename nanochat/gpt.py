@@ -71,14 +71,12 @@ class CausalSelfAttention(nn.Module):
         # Layer 0 with RLS: dual-stream attention (main tokens + side tokens from prev_state)
         if self.layer_idx == 0 and prev_state is not None and rls_components is not None:
             # Unpack RLS components
-            E_type_main, E_type_side, side_mlp = rls_components
-
-            # Compute side embeddings from prev_state using side MLP
-            s = side_mlp(prev_state)  # (B, T, n_embd)
+            E_type_main, E_type_side = rls_components
 
             # Add type embeddings to distinguish main vs side streams
+            # Use prev_state directly - it's already a rich 768-dim hidden state
             h_main = x + E_type_main  # (B, T, n_embd)
-            h_side = s + E_type_side  # (B, T, n_embd)
+            h_side = prev_state + E_type_side  # (B, T, n_embd)
 
             # Project queries (only from main stream - side tokens never query)
             q = self.c_q(h_main).view(B, T, self.n_head, self.head_dim)
@@ -219,16 +217,9 @@ class GPT(nn.Module):
             # Type embeddings to distinguish main vs side token streams
             self.E_type_main = nn.Parameter(torch.zeros(config.n_embd))
             self.E_type_side = nn.Parameter(torch.zeros(config.n_embd))
-            # Side MLP: maps prev_state features to side embeddings (2 layers, GELU)
-            self.side_mlp = nn.Sequential(
-                nn.Linear(config.n_embd, config.n_embd, bias=False),
-                nn.GELU(),
-                nn.Linear(config.n_embd, config.n_embd, bias=False)
-            )
         else:
             self.E_type_main = None
             self.E_type_side = None
-            self.side_mlp = None
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
@@ -302,9 +293,6 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into groups (matrix, embedding, lm_head, RLS components)
         matrix_params = list(self.transformer.h.parameters())
-        # Add RLS side_mlp to matrix params for Muon optimizer (it's a 2D matrix)
-        if self.config.recurrent_layer_state:
-            matrix_params.extend(list(self.side_mlp.parameters()))
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         # Type embeddings are 1D vectors, so they go to AdamW (Muon requires 2D+ matrices)
@@ -363,7 +351,7 @@ class GPT(nn.Module):
         # Pack RLS components for layer 0 (if enabled)
         rls_components = None
         if self.config.recurrent_layer_state and prev_state is not None:
-            rls_components = (self.E_type_main, self.E_type_side, self.side_mlp)
+            rls_components = (self.E_type_main, self.E_type_side)
 
         x = norm(x)
         for block in self.transformer.h:

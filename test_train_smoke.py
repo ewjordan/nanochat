@@ -93,8 +93,6 @@ def test_training_smoke():
     rls_param_grads = {
         'E_type_main': model.E_type_main.grad is not None,
         'E_type_side': model.E_type_side.grad is not None,
-        'side_mlp.0': model.side_mlp[0].weight.grad is not None,
-        'side_mlp.2': model.side_mlp[2].weight.grad is not None,
     }
 
     for name, has_grad in rls_param_grads.items():

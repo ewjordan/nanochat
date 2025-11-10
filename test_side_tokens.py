@@ -109,16 +109,15 @@ def test_rls_side_tokens():
 
     model.eval()
 
-    # Test 7: Check that type embeddings and side_mlp exist
+    # Test 7: Check that type embeddings exist
     print("\n[Test 7] Check RLS components exist...")
     assert hasattr(model, 'E_type_main'), "Missing E_type_main"
     assert hasattr(model, 'E_type_side'), "Missing E_type_side"
-    assert hasattr(model, 'side_mlp'), "Missing side_mlp"
+    assert not hasattr(model, 'side_mlp'), "side_mlp should not exist (removed)"
     assert model.E_type_main.shape == (config.n_embd,)
     assert model.E_type_side.shape == (config.n_embd,)
     print(f"  E_type_main shape: {model.E_type_main.shape}")
     print(f"  E_type_side shape: {model.E_type_side.shape}")
-    print(f"  side_mlp: {model.side_mlp}")
     print(f"  ✓ Pass")
 
     # Test 8: Check layer 0 uses dual-stream attention
