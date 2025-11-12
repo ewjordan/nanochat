@@ -33,6 +33,9 @@ class GPTConfig:
     n_embd: int = 768
     recurrent_layer_state: bool = False # enable recurrent layer state passing
     num_recurrence_warmup: int = 1 # number of warmup passes for training
+    # Ablation flags for testing RLS side token dominance hypothesis
+    mask_side_attention: bool = False # prevent attention to side tokens during training
+    zero_prev_state: bool = False # zero out prev_state to disable side stream
 
 
 def norm(x):
@@ -53,6 +56,7 @@ def apply_rotary_emb(x, cos, sin):
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.config = config  # Store config for ablation flags
         self.layer_idx = layer_idx
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
@@ -121,6 +125,9 @@ class CausalSelfAttention(nn.Module):
                 # Training: causal mask for 2T
                 mask_main = torch.tril(torch.ones(Tq, Tk, dtype=torch.bool, device=q.device))
                 mask_side = torch.tril(torch.ones(Tq, Tk, dtype=torch.bool, device=q.device))
+                # ABLATION: Prevent attention to side tokens to test dominance hypothesis
+                if self.training and self.config.mask_side_attention:
+                    mask_side = torch.zeros(Tq, Tk, dtype=torch.bool, device=q.device)
                 attn_mask = torch.cat([mask_main, mask_side], dim=1)  # (Tq, 2*Tk)
                 y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
             elif Tq == 1:
@@ -135,9 +142,11 @@ class CausalSelfAttention(nn.Module):
                     attn_mask[:, :prefix_len] = True  # Attend to main prefix
                 attn_mask[:, prefix_len:Tk] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))  # Causal main
                 # Side stream (same pattern, offset by Tk)
-                if prefix_len > 0:
-                    attn_mask[:, Tk:Tk+prefix_len] = True  # Attend to side prefix
-                attn_mask[:, Tk+prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))  # Causal side
+                # ABLATION: Skip side stream masking if mask_side_attention is enabled during training
+                if not (self.training and self.config.mask_side_attention):
+                    if prefix_len > 0:
+                        attn_mask[:, Tk:Tk+prefix_len] = True  # Attend to side prefix
+                    attn_mask[:, Tk+prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))  # Causal side
                 y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
 
         else:
@@ -342,6 +351,10 @@ class GPT(nn.Module):
 
         # prev_state will be integrated via side tokens in layer 0's attention (if RLS enabled)
         # No mixing at the input layer - embeddings remain pure
+
+        # ABLATION: Zero out prev_state to test if side token dominance causes failure
+        if self.config.zero_prev_state and prev_state is not None and self.config.recurrent_layer_state:
+            prev_state = torch.zeros_like(prev_state)
 
         # Side stream dropout: randomly zero out prev_state during training to maintain base competence
         if self.training and prev_state is not None and self.config.recurrent_layer_state:
