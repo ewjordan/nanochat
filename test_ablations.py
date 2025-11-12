@@ -85,6 +85,10 @@ if __name__ == "__main__":
     config3 = GPTConfig(**base_config, mask_side_attention=True)
     main3, side3, ratio3 = test_ablation("RLS with mask_side_attention", config3)
 
+    # Test 4: 100% side dropout (expect side ~= 0)
+    config4 = GPTConfig(**base_config, side_dropout_rate=1.0)
+    main4, side4, ratio4 = test_ablation("RLS with 100% side dropout", config4)
+
     # Summary
     print("\n" + "="*60)
     print("SUMMARY")
@@ -94,6 +98,7 @@ if __name__ == "__main__":
     print(f"{'Normal RLS':<30} {main1:>12.6f} {side1:>12.6f} {ratio1:>10.2f}x")
     print(f"{'zero_prev_state':<30} {main2:>12.6f} {side2:>12.6f} {ratio2:>10.2f}x")
     print(f"{'mask_side_attention':<30} {main3:>12.6f} {side3:>12.6f} {ratio3:>10.2f}x")
+    print(f"{'100% side dropout':<30} {main4:>12.6f} {side4:>12.6f} {ratio4:>10.2f}x")
 
     print("\n" + "="*60)
     print("VALIDATION")
@@ -119,6 +124,12 @@ if __name__ == "__main__":
         all_pass = False
     else:
         print(f"✓ mask_side_attention disables side stream ({side3:.6f})")
+
+    if side4 > 0.01:
+        print(f"❌ FAIL: 100% side dropout should nearly eliminate side gradients (got {side4:.6f})")
+        all_pass = False
+    else:
+        print(f"✓ 100% side dropout disables side stream ({side4:.6f})")
 
     if all_pass:
         print("\n✅ All ablations working correctly!")

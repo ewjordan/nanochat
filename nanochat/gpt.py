@@ -36,6 +36,7 @@ class GPTConfig:
     # Ablation flags for testing RLS side token dominance hypothesis
     mask_side_attention: bool = False # prevent attention to side tokens during training
     zero_prev_state: bool = False # zero out prev_state to disable side stream
+    side_dropout_rate: float = 0.15 # dropout rate for side stream (0.15 = 15% dropout, 1.0 = 100% dropout)
 
 
 def norm(x):
@@ -358,7 +359,7 @@ class GPT(nn.Module):
 
         # Side stream dropout: randomly zero out prev_state during training to maintain base competence
         if self.training and prev_state is not None and self.config.recurrent_layer_state:
-            drop_mask = (torch.rand(B, 1, 1, device=prev_state.device) > 0.15).to(prev_state.dtype)
+            drop_mask = (torch.rand(B, 1, 1, device=prev_state.device) > self.config.side_dropout_rate).to(prev_state.dtype)
             prev_state = prev_state * drop_mask
 
         # Pack RLS components for layer 0 (if enabled)

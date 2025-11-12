@@ -40,6 +40,10 @@ depth = 20 # the depth of the Transformer model to train, rest of the kwargs are
 max_seq_len = 2048 # max context length
 recurrent_layer_state = False # enable recurrent layer state passing
 num_recurrence_warmup = 1 # number of warmup passes when using recurrent layer state
+# RLS ablation flags for debugging
+mask_side_attention = False # prevent attention to side tokens (ablation to test side dominance theory)
+zero_prev_state = False # zero out prev_state (ablation to test side dominance theory)
+side_dropout_rate = 0.15 # dropout rate for side stream
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
@@ -112,7 +116,7 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # -----------------------------------------------------------------------------
 # Initialize the Model
 print0("Creating model config...")
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, recurrent_layer_state=recurrent_layer_state, num_recurrence_warmup=num_recurrence_warmup)
+model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, recurrent_layer_state=recurrent_layer_state, num_recurrence_warmup=num_recurrence_warmup, mask_side_attention=mask_side_attention, zero_prev_state=zero_prev_state, side_dropout_rate=side_dropout_rate)
 print0("Initializing model on meta device...")
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
