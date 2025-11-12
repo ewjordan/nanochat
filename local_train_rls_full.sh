@@ -30,12 +30,12 @@ NUM_SHARDS=4    # Change to 71 for Chinchilla optimal
 DEPTH=12          # ~186M params (12 layers, 768 dim)
 MAX_SEQ_LEN=512
 
-# H100-optimized batch sizes
-# Use same batch size for both runs for fair comparison
-# Batch size affects optimization dynamics, so we need apples-to-apples
-# RLS layer-0 uses 2x memory (T×2T attention), so we reduce from 256→128
-DEVICE_BATCH=128   # Fits both baseline and RLS comfortably
-TOTAL_BATCH=65536   # 128 * 512 (single gradient accumulation step)
+# Batch size configuration
+# Using smaller batch size (512) as it showed better RLS performance in local tests
+# Large batch sizes (65,536) caused RLS to plateau catastrophically
+# This matches the local 500-step test that showed only 3.6% gap vs baseline
+DEVICE_BATCH=1     # Small device batch, gradient accumulation will handle the rest
+TOTAL_BATCH=512    # Match local test settings that worked better
 
 # Calculate number of iterations for full epoch
 # Each shard has ~250M chars, compression ~4.8 chars/token
@@ -53,10 +53,11 @@ echo "  Device batch size: $DEVICE_BATCH"
 echo "  Total batch size: $TOTAL_BATCH tokens"
 if [ "$NUM_SHARDS" -eq 4 ]; then
     echo "  Training regime: Full epoch (1 pass through data)"
-    echo "  Estimated time: ~25 min on H100 (batch_size=128)"
+    echo "  Estimated time: ~5-15 hours on H100 (batch_size=512, less efficient than large batches)"
+    echo "  NOTE: Testing batch size hypothesis - large batches (65k) caused catastrophic plateau"
 else
     echo "  Training regime: Chinchilla optimal"
-    echo "  Estimated time: ~7 hours on H100 (batch_size=128)"
+    echo "  Estimated time: ~90-250 hours on H100 (batch_size=512)"
 fi
 echo ""
 

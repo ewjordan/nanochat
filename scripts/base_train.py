@@ -236,6 +236,7 @@ for step in range(num_iterations + 1):
     # use the original uncompiled model because the inputs keep changing shape
     if master_process and (last_step or (sample_every > 0 and step > 0 and step % sample_every == 0)):
         model.eval()
+        orig_model.eval()  # ensure orig_model is also in eval mode for deterministic sampling
         prompts = [
             "The capital of France is",
             "The chemical symbol of gold is",
@@ -251,6 +252,7 @@ for step in range(num_iterations + 1):
             with autocast_ctx:
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
+        orig_model.train()  # restore orig_model to training mode
         model.train()
 
     # save checkpoint at the end of the run (only on master process)
