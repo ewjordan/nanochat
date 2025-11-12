@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-RLS Diagnostic Script - Investigate training failure
+RLS Diagnostic Script - Test Three Theories
 
-Tests different hypotheses:
-1. Gradient flow to RLS components
-2. Warmup iteration count (1 vs 3 vs 5)
-3. Prev_state magnitude/distribution
-4. Learning dynamics comparison
+Tests three theories for RLS failure:
+1. Side Token Attention Dominance
+2. Batch Size Scaling Problem
+3. Gradient Flow Architecture Issue
+
+Logs:
+- Attention patterns (main vs side)
+- Layer-wise gradient norms
+- Type embedding gradients
+- Embedding vs layer gradient comparison
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.dataloader import tokenizing_distributed_data_loader
@@ -24,42 +30,45 @@ config = GPTConfig(
     n_kv_head=6,
     sequence_len=512,
     recurrent_layer_state=True,
-    num_recurrence_warmup=1,  # Will vary this
+    num_recurrence_warmup=1,
 )
 
-def check_gradient_flow(model, x, y, warmup_iters=1):
-    """Check if RLS components receive gradients"""
-    model.config.num_recurrence_warmup = warmup_iters
+def check_gradient_flow(model, x, y):
+    """Check gradients for all layers and RLS components"""
     model.train()
-
-    # Zero gradients
     model.zero_grad()
 
     # Forward + backward
     loss = model.forward_with_recurrence(x, y)
     loss.backward()
 
-    # Check RLS component gradients
-    results = {
-        'E_type_main': model.E_type_main.grad,
-        'E_type_side': model.E_type_side.grad,
-        'side_mlp.0.weight': model.side_mlp[0].weight.grad,
-        'side_mlp.2.weight': model.side_mlp[2].weight.grad,
+    # Collect layer-wise gradient norms
+    layer_grads = {}
+    for i, block in enumerate(model.transformer.h):
+        attn_grads = [p.grad.norm().item() for p in block.attn.parameters() if p.grad is not None]
+        mlp_grads = [p.grad.norm().item() for p in block.mlp.parameters() if p.grad is not None]
+        layer_grads[f'layer{i}_attn'] = sum(attn_grads) / max(len(attn_grads), 1)
+        layer_grads[f'layer{i}_mlp'] = sum(mlp_grads) / max(len(mlp_grads), 1)
+
+    # RLS component gradients
+    rls_grads = {
+        'E_type_main': model.E_type_main.grad.norm().item() if model.E_type_main.grad is not None else 0.0,
+        'E_type_side': model.E_type_side.grad.norm().item() if model.E_type_side.grad is not None else 0.0,
     }
 
-    stats = {}
-    for name, grad in results.items():
-        if grad is None:
-            stats[name] = {'exists': False}
-        else:
-            stats[name] = {
-                'exists': True,
-                'mean': grad.mean().item(),
-                'std': grad.std().item(),
-                'max': grad.abs().max().item(),
-            }
+    # Embedding gradients
+    wte_grad = model.transformer.wte.weight.grad.norm().item() if model.transformer.wte.weight.grad is not None else 0.0
 
-    return loss.item(), stats
+    # Overall gradient norm
+    total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()
+
+    return {
+        'loss': loss.item(),
+        'total_grad_norm': total_grad_norm,
+        'layer_grads': layer_grads,
+        'rls_grads': rls_grads,
+        'wte_grad': wte_grad,
+    }
 
 
 def check_prev_state_stats(model, x, warmup_iters=1):
@@ -93,125 +102,39 @@ def check_prev_state_stats(model, x, warmup_iters=1):
     return prev_state, states_over_warmup
 
 
-def training_step_comparison(model, x, y, warmup_iters=1):
-    """Compare a training step with different warmup settings"""
-    model.config.num_recurrence_warmup = warmup_iters
-    model.train()
-    model.zero_grad()
+def run_training_steps(model, data_loader, optimizer, steps=10):
+    """Run several training steps and collect metrics"""
+    metrics = []
 
-    # Measure time and loss
-    import time
-    start = time.time()
-    loss = model.forward_with_recurrence(x, y)
-    loss.backward()
-    elapsed = time.time() - start
+    for step in range(steps):
+        x, y = next(data_loader)
+        stats = check_gradient_flow(model, x, y)
+        optimizer.step()
+        metrics.append(stats)
 
-    # Gather gradient stats for all parameters
-    grad_norms = {}
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            grad_norms[name] = param.grad.norm().item()
-
-    return {
-        'warmup_iters': warmup_iters,
-        'loss': loss.item(),
-        'time': elapsed,
-        'rls_grad_norms': {
-            'E_type_main': grad_norms.get('E_type_main', 0),
-            'E_type_side': grad_norms.get('E_type_side', 0),
-            'side_mlp.0.weight': grad_norms.get('side_mlp.0.weight', 0),
-            'side_mlp.2.weight': grad_norms.get('side_mlp.2.weight', 0),
-        }
-    }
+    return metrics
 
 
 def main():
-    print("=" * 60)
-    print("RLS Diagnostic Tests")
-    print("=" * 60)
+    print("=" * 80)
+    print("RLS Gradient Flow Diagnostics - Testing Three Theories")
+    print("=" * 80)
     print()
 
     # Setup
-    device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
     print(f"Device: {device}")
 
     # Load tokenizer
-    base_dir = os.path.expanduser("~/.cache/nanochat")
     tokenizer = get_tokenizer()
     print(f"Loaded tokenizer (vocab_size={tokenizer.get_vocab_size()})")
 
-    # Create model
-    print("Creating model...")
+    # Create RLS model
+    print("Creating RLS model...")
     model = GPT(config).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print()
 
-    # Get a batch of data
-    print("Loading data batch...")
-    data_loader = tokenizing_distributed_data_loader(
-        B=2,  # Small batch for speed
-        T=512,
-        split="train",
-        tokenizer_threads=1,
-        device=device
-    )
-    x, y = next(data_loader)
-    print(f"Batch shape: {x.shape}")
-    print()
-
-    # Test 1: Gradient flow check
-    print("=" * 60)
-    print("TEST 1: Gradient Flow to RLS Components")
-    print("=" * 60)
-    for warmup in [1, 3, 5]:
-        print(f"\nWarmup iterations: {warmup}")
-        loss, grad_stats = check_gradient_flow(model, x, y, warmup_iters=warmup)
-        print(f"Loss: {loss:.4f}")
-        for name, stats in grad_stats.items():
-            if stats['exists']:
-                print(f"  {name:20s}: mean={stats['mean']:+.6f}, std={stats['std']:.6f}, max={stats['max']:.6f}")
-            else:
-                print(f"  {name:20s}: NO GRADIENT")
-
-    # Test 2: Prev_state statistics
-    print("\n" + "=" * 60)
-    print("TEST 2: Prev_state Evolution During Warmup")
-    print("=" * 60)
-    for warmup in [1, 3, 5]:
-        print(f"\nWarmup iterations: {warmup}")
-        final_state, state_history = check_prev_state_stats(model, x, warmup_iters=warmup)
-        for stats in state_history:
-            i = stats['iteration']
-            print(f"  Iteration {i}: mean={stats['mean']:+.6f}, std={stats['std']:.6f}, max={stats['max']:.6f}")
-        print(f"  Final prev_state: mean={final_state.mean().item():+.6f}, std={final_state.std().item():.6f}")
-
-    # Test 3: Training step comparison
-    print("\n" + "=" * 60)
-    print("TEST 3: Training Step Comparison (5 steps each)")
-    print("=" * 60)
-
-    for warmup in [1, 3, 5]:
-        print(f"\nWarmup iterations: {warmup}")
-        model = GPT(config).to(device)  # Fresh model
-        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-
-        losses = []
-        for step in range(5):
-            stats = training_step_comparison(model, x, y, warmup_iters=warmup)
-            optimizer.step()
-            losses.append(stats['loss'])
-
-            if step == 0:
-                print(f"  Step {step}: loss={stats['loss']:.4f}, time={stats['time']:.3f}s")
-                print(f"    RLS grad norms: E_type_main={stats['rls_grad_norms']['E_type_main']:.6f}, "
-                      f"side_mlp.0={stats['rls_grad_norms']['side_mlp.0.weight']:.6f}")
-
-        print(f"  Loss progression: {losses[0]:.4f} → {losses[-1]:.4f} (delta: {losses[-1]-losses[0]:+.4f})")
-
-    # Test 4: Baseline comparison (no RLS)
-    print("\n" + "=" * 60)
-    print("TEST 4: Baseline (no RLS) Comparison")
-    print("=" * 60)
+    # Create baseline for comparison
     baseline_config = GPTConfig(
         vocab_size=65536,
         n_layer=12,
@@ -222,26 +145,116 @@ def main():
         recurrent_layer_state=False,
     )
     baseline_model = GPT(baseline_config).to(device)
-    baseline_optimizer = torch.optim.AdamW(baseline_model.parameters(), lr=3e-4)
+    print(f"Baseline parameters: {sum(p.numel() for p in baseline_model.parameters()):,}")
+    print()
 
-    baseline_losses = []
-    for step in range(5):
-        baseline_model.zero_grad()
-        loss = baseline_model(x, y)
-        loss.backward()
-        baseline_optimizer.step()
-        baseline_losses.append(loss.item())
+    # Setup data loader
+    print("Loading data...")
+    data_loader = tokenizing_distributed_data_loader(
+        B=1,  # Small batch for fast testing
+        T=512,
+        split="train",
+        tokenizer_threads=1,
+        device=device,
+    )
 
-    print(f"Baseline loss progression: {baseline_losses[0]:.4f} → {baseline_losses[-1]:.4f} (delta: {baseline_losses[-1]-baseline_losses[0]:+.4f})")
+    # Get a single batch for testing
+    x, y = next(data_loader)
+    print(f"Batch shape: {x.shape}")
+    print()
 
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    print("Check the results above to diagnose:")
-    print("1. Are RLS gradients flowing? (magnitudes should be non-zero)")
-    print("2. Does warmup iteration count affect prev_state quality?")
-    print("3. Does RLS learn as fast as baseline in early steps?")
-    print("4. Are gradient norms reasonable compared to other parameters?")
+    # =================================================================
+    # Test: Gradient Flow Comparison (Theory 3)
+    # =================================================================
+    print("=" * 80)
+    print("TEST: Gradient Flow Comparison (RLS vs Baseline)")
+    print("=" * 80)
+    print()
+
+    print("RLS Model:")
+    rls_stats = check_gradient_flow(model, x, y)
+    print(f"  Loss: {rls_stats['loss']:.6f}")
+    print(f"  Total grad norm: {rls_stats['total_grad_norm']:.6f}")
+    print(f"  wte grad: {rls_stats['wte_grad']:.6f}")
+    print(f"  E_type_main grad: {rls_stats['rls_grads']['E_type_main']:.6f}")
+    print(f"  E_type_side grad: {rls_stats['rls_grads']['E_type_side']:.6f}")
+    print(f"  E_type ratio (side/main): {rls_stats['rls_grads']['E_type_side'] / max(rls_stats['rls_grads']['E_type_main'], 1e-10):.2f}x")
+    print()
+    print("  Layer-wise gradients (attention):")
+    for i in range(12):
+        print(f"    Layer {i:2d}: {rls_stats['layer_grads'][f'layer{i}_attn']:.6f}")
+    print()
+
+    print("Baseline Model:")
+    baseline_model.zero_grad()
+    baseline_loss = baseline_model(x, y)
+    baseline_loss.backward()
+    baseline_grad_norm = torch.nn.utils.clip_grad_norm_(baseline_model.parameters(), float('inf')).item()
+    baseline_wte_grad = baseline_model.transformer.wte.weight.grad.norm().item()
+    baseline_layer0_grads = [p.grad.norm().item() for p in baseline_model.transformer.h[0].attn.parameters() if p.grad is not None]
+    baseline_layer0_attn = sum(baseline_layer0_grads) / max(len(baseline_layer0_grads), 1)
+
+    print(f"  Loss: {baseline_loss.item():.6f}")
+    print(f"  Total grad norm: {baseline_grad_norm:.6f}")
+    print(f"  wte grad: {baseline_wte_grad:.6f}")
+    print(f"  Layer 0 attn grad: {baseline_layer0_attn:.6f}")
+    print()
+
+    # Analysis
+    print("=" * 80)
+    print("ANALYSIS")
+    print("=" * 80)
+    print()
+
+    print("Theory 1: Side Token Attention Dominance")
+    E_type_ratio = rls_stats['rls_grads']['E_type_side'] / max(rls_stats['rls_grads']['E_type_main'], 1e-10)
+    if E_type_ratio > 10:
+        print(f"  ⚠️  E_type_side grad is {E_type_ratio:.1f}x larger than E_type_main")
+        print("  This suggests side tokens might be dominating attention")
+    else:
+        print(f"  ✓ E_type gradients are relatively balanced ({E_type_ratio:.1f}x)")
+    print()
+
+    print("Theory 2: Batch Size Scaling")
+    print("  (Requires running with different batch sizes: 512, 8192, 65536)")
+    print(f"  Current batch size: 512")
+    print()
+
+    print("Theory 3: Gradient Flow Architecture Issue")
+    grad_ratio = rls_stats['total_grad_norm'] / baseline_grad_norm
+    layer0_ratio = rls_stats['layer_grads']['layer0_attn'] / baseline_layer0_attn
+    wte_ratio = rls_stats['wte_grad'] / baseline_wte_grad
+
+    print(f"  Overall gradient strength (RLS/Baseline): {grad_ratio:.2f}x")
+    print(f"  Layer 0 gradient strength (RLS/Baseline): {layer0_ratio:.2f}x")
+    print(f"  Embedding gradient strength (RLS/Baseline): {wte_ratio:.2f}x")
+
+    if grad_ratio < 0.7:
+        print(f"  ⚠️  RLS has {(1-grad_ratio)*100:.0f}% weaker gradients overall")
+        print("  This suggests fundamental gradient flow issue")
+    else:
+        print("  ✓ Gradient strengths are comparable")
+
+    if layer0_ratio < 0.5:
+        print(f"  ⚠️  Layer 0 has particularly weak gradients in RLS")
+        print("  This confirms dual-stream attention dampens gradients")
+
+    print()
+    print("=" * 80)
+    print("CONCLUSION")
+    print("=" * 80)
+    print()
+    print("Based on this single-step analysis:")
+    if grad_ratio < 0.7:
+        print("  → Theory 3 (Gradient Flow) is SUPPORTED")
+        print(f"    RLS shows systematically weaker gradients ({(1-grad_ratio)*100:.0f}% weaker)")
+    if E_type_ratio > 10:
+        print("  → Theory 1 (Side Dominance) is SUPPORTED")
+        print(f"    E_type_side receives {E_type_ratio:.1f}x more gradient than E_type_main")
+    if grad_ratio >= 0.7 and E_type_ratio <= 10:
+        print("  → No clear gradient flow issue detected")
+        print("    Theory 2 (Batch Size) may be more relevant")
+    print()
 
 
 if __name__ == "__main__":
