@@ -37,6 +37,13 @@ class GPTConfig:
     mask_side_attention: bool = False # prevent attention to side tokens during training
     zero_prev_state: bool = False # zero out prev_state to disable side stream
     side_dropout_rate: float = 0.15 # dropout rate for side stream (0.15 = 15% dropout, 1.0 = 100% dropout)
+    side_type_gate: bool = False # scale side type embedding based on prev_state strength
+    side_type_gate_temp: float = 4.0 # temperature for sigmoid gate
+    side_type_gate_eps: float = 1e-6 # avoid division by zero when normalizing
+    side_type_gate_ema_beta: float = 0.01 # update rate for running prev_state norm baseline
+    side_stream_initial_scale: float = 0.1 # scheduled scale for prev_state/type embeddings at step 0
+    side_stream_final_scale: float = 1.0 # scale after schedule completes
+    side_stream_schedule_steps: int = 500 # number of steps to reach final scale
 
 
 def norm(x):
@@ -76,12 +83,25 @@ class CausalSelfAttention(nn.Module):
         # Layer 0 with RLS: dual-stream attention (main tokens + side tokens from prev_state)
         if self.layer_idx == 0 and prev_state is not None and rls_components is not None:
             # Unpack RLS components
-            E_type_main, E_type_side = rls_components
+            if len(rls_components) == 4:
+                E_type_main, E_type_side, type_gate, side_scale = rls_components
+            elif len(rls_components) == 3:
+                E_type_main, E_type_side, type_gate = rls_components
+                side_scale = 1.0
+            else:
+                E_type_main, E_type_side = rls_components
+                type_gate = None
+                side_scale = 1.0
 
             # Add type embeddings to distinguish main vs side streams
             # Use prev_state directly - it's already a rich 768-dim hidden state
             h_main = x + E_type_main  # (B, T, n_embd)
-            h_side = prev_state + E_type_side  # (B, T, n_embd)
+            scale_tensor = torch.as_tensor(side_scale, dtype=prev_state.dtype, device=prev_state.device)
+            if type_gate is None:
+                side_type = E_type_side
+            else:
+                side_type = type_gate * E_type_side.view(1, 1, -1)
+            h_side = prev_state + scale_tensor * side_type  # (B, T, n_embd)
 
             # Project queries (only from main stream - side tokens never query)
             q = self.c_q(h_main).view(B, T, self.n_head, self.head_dim)
@@ -222,6 +242,9 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self._last_type_gate_stats = None
+        self._last_side_stream_enabled = False
+        self.register_buffer("type_gate_ema", torch.tensor(1.0), persistent=False)
         # Recurrent layer state: side token architecture
         if config.recurrent_layer_state:
             # Type embeddings to distinguish main vs side token streams
@@ -336,7 +359,7 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', prev_state=None, return_state=False):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', prev_state=None, return_state=False, side_stream_scale=1.0):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
@@ -353,19 +376,53 @@ class GPT(nn.Module):
         # prev_state will be integrated via side tokens in layer 0's attention (if RLS enabled)
         # No mixing at the input layer - embeddings remain pure
 
+        self._last_type_gate_stats = None
+        self._last_side_stream_enabled = False
+
         # ABLATION: Zero out prev_state to test if side token dominance causes failure
         if self.config.zero_prev_state and prev_state is not None and self.config.recurrent_layer_state:
             prev_state = torch.zeros_like(prev_state)
 
-        # Side stream dropout: randomly zero out prev_state during training to maintain base competence
+        # Side stream dropout: occasionally run batches without RLS entirely to keep raw competence.
+        # Removing the side stream (instead of zeroing it) avoids pushing gigantic gradients through identical tokens.
+        side_stream_scale = float(side_stream_scale)
+
         if self.training and prev_state is not None and self.config.recurrent_layer_state:
-            drop_mask = (torch.rand(B, 1, 1, device=prev_state.device) > self.config.side_dropout_rate).to(prev_state.dtype)
-            prev_state = prev_state * drop_mask
+            if self.config.side_dropout_rate >= 1.0:
+                prev_state = None
+            elif self.config.side_dropout_rate > 0.0:
+                if torch.rand((), device=prev_state.device) < self.config.side_dropout_rate:
+                    prev_state = None
+
+        # Optional type gating: scale E_type_side contribution based on prev_state strength
+        type_gate = None
+        if (
+            self.config.recurrent_layer_state
+            and prev_state is not None
+            and self.config.side_type_gate
+        ):
+            prev_norm = prev_state.norm(dim=-1, keepdim=True)
+            ema = self.type_gate_ema.to(prev_state.device, prev_state.dtype)
+            denom = ema + self.config.side_type_gate_eps
+            ratio = prev_norm / denom
+            gate = torch.sigmoid(self.config.side_type_gate_temp * (ratio - 1.0))
+            gate_detached = gate.detach()
+            self._last_type_gate_stats = (
+                gate_detached.mean().item(),
+                gate_detached.max().item(),
+                gate_detached.min().item(),
+            )
+            type_gate = gate
+            with torch.no_grad():
+                ema_update = (1 - self.config.side_type_gate_ema_beta) * ema + self.config.side_type_gate_ema_beta * prev_norm.mean()
+                self.type_gate_ema = ema_update.detach()
 
         # Pack RLS components for layer 0 (if enabled)
         rls_components = None
         if self.config.recurrent_layer_state and prev_state is not None:
-            rls_components = (self.E_type_main, self.E_type_side)
+            prev_state = prev_state * side_stream_scale
+            rls_components = (self.E_type_main, self.E_type_side, type_gate, side_stream_scale)
+            self._last_side_stream_enabled = True
 
         x = norm(x)
         for block in self.transformer.h:
@@ -401,7 +458,7 @@ class GPT(nn.Module):
                 return logits, final_state
             return logits
 
-    def forward_with_recurrence(self, idx, targets=None, loss_reduction='mean'):
+    def forward_with_recurrence(self, idx, targets=None, loss_reduction='mean', side_stream_scale=1.0):
         """
         Forward pass with recurrent layer state.
         Performs warmup passes to compute previous token states, then does the real forward pass.
@@ -422,7 +479,7 @@ class GPT(nn.Module):
         # Note: forward() will skip lm_head when targets=None and return_state=True
         for i in range(self.config.num_recurrence_warmup):
             with torch.no_grad():
-                _, warmup_state = self.forward(idx, targets=None, prev_state=prev_state, return_state=True)
+                _, warmup_state = self.forward(idx, targets=None, prev_state=prev_state, return_state=True, side_stream_scale=side_stream_scale)
                 # Shift: position i gets position i-1's output, position 0 gets zeros
                 prev_state = torch.cat([
                     torch.zeros(B, 1, self.config.n_embd, dtype=model_dtype, device=device),
@@ -430,7 +487,7 @@ class GPT(nn.Module):
                 ], dim=1)
 
         # Real forward pass with gradients
-        return self.forward(idx, targets=targets, loss_reduction=loss_reduction, prev_state=prev_state, return_state=False)
+        return self.forward(idx, targets=targets, loss_reduction=loss_reduction, prev_state=prev_state, return_state=False, side_stream_scale=side_stream_scale)
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

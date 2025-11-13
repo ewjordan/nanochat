@@ -44,6 +44,13 @@ num_recurrence_warmup = 1 # number of warmup passes when using recurrent layer s
 mask_side_attention = False # prevent attention to side tokens (ablation to test side dominance theory)
 zero_prev_state = False # zero out prev_state (ablation to test side dominance theory)
 side_dropout_rate = 0.15 # dropout rate for side stream
+side_type_gate = False # scale side type embeddings based on prev_state strength
+side_type_gate_temp = 4.0
+side_type_gate_eps = 1e-6
+side_type_gate_ema_beta = 0.01
+side_stream_initial_scale = 0.1
+side_stream_final_scale = 1.0
+side_stream_schedule_steps = 500
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
@@ -116,7 +123,26 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # -----------------------------------------------------------------------------
 # Initialize the Model
 print0("Creating model config...")
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, recurrent_layer_state=recurrent_layer_state, num_recurrence_warmup=num_recurrence_warmup, mask_side_attention=mask_side_attention, zero_prev_state=zero_prev_state, side_dropout_rate=side_dropout_rate)
+model_config_kwargs = dict(
+    sequence_len=max_seq_len,
+    vocab_size=vocab_size,
+    n_layer=num_layers,
+    n_head=num_heads,
+    n_kv_head=num_kv_heads,
+    n_embd=model_dim,
+    recurrent_layer_state=recurrent_layer_state,
+    num_recurrence_warmup=num_recurrence_warmup,
+    mask_side_attention=mask_side_attention,
+    zero_prev_state=zero_prev_state,
+    side_dropout_rate=side_dropout_rate,
+    side_type_gate=side_type_gate,
+    side_type_gate_temp=side_type_gate_temp,
+    side_type_gate_eps=side_type_gate_eps,
+    side_type_gate_ema_beta=side_type_gate_ema_beta,
+    side_stream_initial_scale=side_stream_initial_scale,
+    side_stream_final_scale=side_stream_final_scale,
+    side_stream_schedule_steps=side_stream_schedule_steps,
+)
 print0("Initializing model on meta device...")
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
@@ -191,6 +217,15 @@ def get_muon_momentum(it):
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
 
+def get_side_stream_scale(step, config):
+    if not config.recurrent_layer_state:
+        return 1.0
+    schedule_steps = config.side_stream_schedule_steps
+    if schedule_steps <= 0:
+        return config.side_stream_final_scale
+    frac = min(step / schedule_steps, 1.0)
+    return config.side_stream_initial_scale + (config.side_stream_final_scale - config.side_stream_initial_scale) * frac
+
 # -----------------------------------------------------------------------------
 # Training loop
 min_val_bpb = float("inf")
@@ -201,6 +236,7 @@ total_training_time = 0 # total wall-clock time of training
 for step in range(num_iterations + 1):
     last_step = step == num_iterations
     flops_so_far = num_flops_per_token * total_batch_size * step
+    side_stream_scale = get_side_stream_scale(step, orig_model.config)
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if last_step or (eval_every > 0 and step % eval_every == 0):
@@ -289,7 +325,7 @@ for step in range(num_iterations + 1):
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             if recurrent_layer_state:
-                loss = orig_model.forward_with_recurrence(x, y)
+                loss = orig_model.forward_with_recurrence(x, y, side_stream_scale=side_stream_scale)
             else:
                 loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -328,8 +364,18 @@ for step in range(num_iterations + 1):
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
+    gate_stats = getattr(orig_model, "_last_type_gate_stats", None)
+    side_stream_enabled = bool(getattr(orig_model, "_last_side_stream_enabled", False))
+    gate_str = ""
+    gate_mean = gate_max = gate_min = None
+    if gate_stats is not None:
+        gate_mean, gate_max, gate_min = gate_stats
+        gate_str = f" gate μ:{gate_mean:.3f} ↑{gate_max:.3f} ↓{gate_min:.3f} | side_on:{int(side_stream_enabled)} |"
+    elif recurrent_layer_state:
+        gate_str = f" side_on:{int(side_stream_enabled)} |"
+    scale_str = f" scale:{side_stream_scale:.3f} |" if recurrent_layer_state else ""
     if step % log_every == 0 or last_step:
-        print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+        print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm}{gate_str}{scale_str} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -343,6 +389,13 @@ for step in range(num_iterations + 1):
         }
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
+        if gate_stats is not None:
+            log_data["train/type_gate_mean"] = gate_mean
+            log_data["train/type_gate_max"] = gate_max
+            log_data["train/type_gate_min"] = gate_min
+        if recurrent_layer_state:
+            log_data["train/side_stream_enabled"] = int(side_stream_enabled)
+            log_data["train/side_stream_scale"] = side_stream_scale
         wandb_run.log(log_data)
 
 # print a few more stats
