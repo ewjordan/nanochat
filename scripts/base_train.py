@@ -51,6 +51,15 @@ side_type_gate_ema_beta = 0.01
 side_stream_initial_scale = 0.1
 side_stream_final_scale = 1.0
 side_stream_schedule_steps = 500
+side_type_scale = 1.0
+side_type_renorm = False
+side_state_rmsnorm = False
+side_output_gate = False
+side_output_gate_init = -5.0
+side_logit_bias = 0.0
+side_logit_bias_trainable = False
+recurrent_layer_state_active = True
+side_dual_softmax = False
 resume_checkpoint_dir = ""
 resume_checkpoint_step = -1
 resume_load_optimizer = True
@@ -82,6 +91,9 @@ model_tag = "" # optionally override the model tag for the output checkpoint dir
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
 user_config = {k: globals()[k] for k in config_keys} # will be useful for logging
+# Prevent enabling runtime recurrence when architecture is disabled
+if not recurrent_layer_state:
+    recurrent_layer_state_active = False
 # -----------------------------------------------------------------------------
 
 # Compute init
@@ -134,6 +146,7 @@ model_config_kwargs = dict(
     n_kv_head=num_kv_heads,
     n_embd=model_dim,
     recurrent_layer_state=recurrent_layer_state,
+    recurrent_layer_state_active=recurrent_layer_state_active,
     num_recurrence_warmup=num_recurrence_warmup,
     mask_side_attention=mask_side_attention,
     zero_prev_state=zero_prev_state,
@@ -145,6 +158,14 @@ model_config_kwargs = dict(
     side_stream_initial_scale=side_stream_initial_scale,
     side_stream_final_scale=side_stream_final_scale,
     side_stream_schedule_steps=side_stream_schedule_steps,
+    side_type_scale=side_type_scale,
+    side_type_renorm=side_type_renorm,
+    side_state_rmsnorm=side_state_rmsnorm,
+    side_output_gate=side_output_gate,
+    side_output_gate_init=side_output_gate_init,
+    side_logit_bias=side_logit_bias,
+    side_logit_bias_trainable=side_logit_bias_trainable,
+    side_dual_softmax=side_dual_softmax,
 )
 print0("Initializing model on meta device...")
 with torch.device("meta"):
@@ -390,12 +411,23 @@ for step in range(start_step, num_iterations + 1):
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
     gate_stats = getattr(orig_model, "_last_type_gate_stats", None)
+    side_gate_stats = getattr(orig_model, "_last_side_gate_stats", None)
+    side_logit_bias = getattr(orig_model, "_last_side_logit_bias", None)
     side_stream_enabled = bool(getattr(orig_model, "_last_side_stream_enabled", False))
     gate_str = ""
-    gate_mean = gate_max = gate_min = None
+    gate_values = {}
     if gate_stats is not None:
-        gate_mean, gate_max, gate_min = gate_stats
-        gate_str = f" gate μ:{gate_mean:.3f} ↑{gate_max:.3f} ↓{gate_min:.3f} | side_on:{int(side_stream_enabled)} |"
+        gate_values["type_gate"] = gate_stats
+    if side_gate_stats is not None:
+        gate_values["side_gate"] = side_gate_stats
+    gate_parts = []
+    for label, stats in gate_values.items():
+        g_mean, g_max, g_min = stats
+        gate_parts.append(f"{label} μ:{g_mean:.3f} ↑{g_max:.3f} ↓{g_min:.3f}")
+    if side_logit_bias is not None:
+        gate_parts.append(f"side_bias:{side_logit_bias:.2f}")
+    if gate_parts:
+        gate_str = " " + " | ".join(gate_parts) + f" | side_on:{int(side_stream_enabled)} |"
     elif recurrent_layer_state:
         gate_str = f" side_on:{int(side_stream_enabled)} |"
     scale_str = f" scale:{side_stream_scale:.3f} |" if recurrent_layer_state else ""
@@ -415,9 +447,17 @@ for step in range(start_step, num_iterations + 1):
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
         if gate_stats is not None:
+            gate_mean, gate_max, gate_min = gate_stats
             log_data["train/type_gate_mean"] = gate_mean
             log_data["train/type_gate_max"] = gate_max
             log_data["train/type_gate_min"] = gate_min
+        if side_gate_stats is not None:
+            sg_mean, sg_max, sg_min = side_gate_stats
+            log_data["train/side_gate_mean"] = sg_mean
+            log_data["train/side_gate_max"] = sg_max
+            log_data["train/side_gate_min"] = sg_min
+        if side_logit_bias is not None:
+            log_data["train/side_logit_bias"] = side_logit_bias
         if recurrent_layer_state:
             log_data["train/side_stream_enabled"] = int(side_stream_enabled)
             log_data["train/side_stream_scale"] = side_stream_scale

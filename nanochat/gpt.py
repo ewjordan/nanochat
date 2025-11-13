@@ -33,6 +33,7 @@ class GPTConfig:
     n_embd: int = 768
     recurrent_layer_state: bool = False # enable recurrent layer state passing
     num_recurrence_warmup: int = 1 # number of warmup passes for training
+    recurrent_layer_state_active: bool = True # allow compiling RLS but running in baseline mode
     # Ablation flags for testing RLS side token dominance hypothesis
     mask_side_attention: bool = False # prevent attention to side tokens during training
     zero_prev_state: bool = False # zero out prev_state to disable side stream
@@ -44,6 +45,14 @@ class GPTConfig:
     side_stream_initial_scale: float = 0.1 # scheduled scale for prev_state/type embeddings at step 0
     side_stream_final_scale: float = 1.0 # scale after schedule completes
     side_stream_schedule_steps: int = 500 # number of steps to reach final scale
+    side_type_scale: float = 1.0 # scalar multiplier for type embeddings (set <<1 to tame magnitude)
+    side_type_renorm: bool = False # optionally RMSNorm after adding type embeddings
+    side_state_rmsnorm: bool = False # RMSNorm prev_state before injecting into layer 0
+    side_output_gate: bool = False # learnable sigmoid gate (per KV head) on side stream
+    side_output_gate_init: float = -5.0 # initialization for the side gate logits
+    side_logit_bias: float = 0.0 # additive bias applied to side logits before softmax
+    side_logit_bias_trainable: bool = False # whether the side logit bias is learnable
+    side_dual_softmax: bool = False # use separate softmaxes for main vs side streams
 
 
 def norm(x):
@@ -76,6 +85,24 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.side_gate = None
+        self.side_logit_bias = None
+        if layer_idx == 0 and config.recurrent_layer_state:
+            if config.side_output_gate:
+                gate_init = torch.full(
+                    (self.n_kv_head,),
+                    config.side_output_gate_init,
+                    dtype=torch.float32,
+                )
+                self.side_gate = nn.Parameter(gate_init)
+            if config.side_logit_bias_trainable or config.side_logit_bias != 0.0:
+                bias_init = torch.tensor(
+                    config.side_logit_bias,
+                    dtype=torch.float32,
+                )
+                self.side_logit_bias = nn.Parameter(bias_init)
+                if not config.side_logit_bias_trainable:
+                    self.side_logit_bias.requires_grad_(False)
 
     def forward(self, x, cos_sin, kv_cache, prev_state=None, rls_components=None):
         B, T, C = x.size()
@@ -94,14 +121,33 @@ class CausalSelfAttention(nn.Module):
                 side_scale = 1.0
 
             # Add type embeddings to distinguish main vs side streams
-            # Use prev_state directly - it's already a rich 768-dim hidden state
-            h_main = x + E_type_main  # (B, T, n_embd)
+            type_scale = float(getattr(self.config, "side_type_scale", 1.0))
+            h_main = x
+            if E_type_main is not None and type_scale != 0.0:
+                type_vec = (type_scale * E_type_main).view(1, 1, -1).to(x.dtype)
+                h_main = h_main + type_vec
+            if getattr(self.config, "side_type_renorm", False):
+                h_main = norm(h_main)
+
             scale_tensor = torch.as_tensor(side_scale, dtype=prev_state.dtype, device=prev_state.device)
-            if type_gate is None:
-                side_type = E_type_side
+            side_body = prev_state
+            if getattr(self.config, "side_state_rmsnorm", False):
+                side_body = norm(side_body)
+            side_body = side_body * scale_tensor
+
+            side_type = None
+            if E_type_side is not None and type_scale != 0.0:
+                base_type = (type_scale * E_type_side).view(1, 1, -1).to(prev_state.dtype)
+                if type_gate is not None:
+                    base_type = type_gate * base_type
+                side_type = base_type
+
+            if side_type is not None:
+                h_side = side_body + side_type
             else:
-                side_type = type_gate * E_type_side.view(1, 1, -1)
-            h_side = prev_state + scale_tensor * side_type  # (B, T, n_embd)
+                h_side = side_body
+            if getattr(self.config, "side_type_renorm", False):
+                h_side = norm(h_side)
 
             # Project queries (only from main stream - side tokens never query)
             q = self.c_q(h_main).view(B, T, self.n_head, self.head_dim)
@@ -111,6 +157,11 @@ class CausalSelfAttention(nn.Module):
             v_main = self.c_v(h_main).view(B, T, self.n_kv_head, self.head_dim)
             k_side = self.c_k(h_side).view(B, T, self.n_kv_head, self.head_dim)
             v_side = self.c_v(h_side).view(B, T, self.n_kv_head, self.head_dim)
+            if self.side_gate is not None:
+                gate = torch.sigmoid(self.side_gate)
+                gate = gate.to(dtype=k_side.dtype, device=k_side.device).view(1, 1, self.n_kv_head, 1)
+                k_side = k_side * gate
+                v_side = v_side * gate
 
             # Apply RoPE to q and both k streams (same position indices)
             cos, sin = cos_sin
@@ -128,47 +179,119 @@ class CausalSelfAttention(nn.Module):
             k_side = k_side.transpose(1, 2)
             v_side = v_side.transpose(1, 2)
 
-            # Concatenate main and side K/V along sequence dimension
-            k = torch.cat([k_main, k_side], dim=2)  # (B, H, 2T, D)
-            v = torch.cat([v_main, v_side], dim=2)  # (B, H, 2T, D)
+            dual_softmax = getattr(self.config, "side_dual_softmax", False)
+
+            # Concatenate main and side K/V along sequence dimension for caching
+            k_combined = torch.cat([k_main, k_side], dim=2)  # (B, H, 2T, D)
+            v_combined = torch.cat([v_main, v_side], dim=2)  # (B, H, 2T, D)
 
             # Handle KV cache for layer 0 (stores 2T positions)
             if kv_cache is not None:
-                k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+                k_combined, v_combined = kv_cache.insert_kv(self.layer_idx, k_combined, v_combined)
 
             Tq = q.size(2)  # number of queries
-            Tk_total = k.size(2)  # total K/V length (2T for dual-stream)
-            Tk = Tk_total // 2  # main stream length
+            Tk_total = k_combined.size(2)  # total K/V length (2T for dual-stream)
+            Tk_main = Tk_total // 2
+            k_main_full = k_combined[:, :, :Tk_main, :]
+            k_side_full = k_combined[:, :, Tk_main:, :]
+            v_main_full = v_combined[:, :, :Tk_main, :]
+            v_side_full = v_combined[:, :, Tk_main:, :]
 
-            # Build causal mask [Tq, 2*Tk]: queries attend to both main and side causally
             enable_gqa = self.n_head != self.n_kv_head
-            if kv_cache is None or Tq == Tk:
-                # Training: causal mask for 2T
-                mask_main = torch.tril(torch.ones(Tq, Tk, dtype=torch.bool, device=q.device))
-                mask_side = torch.tril(torch.ones(Tq, Tk, dtype=torch.bool, device=q.device))
-                # ABLATION: Prevent attention to side tokens to test dominance hypothesis
-                if self.training and self.config.mask_side_attention:
-                    mask_side = torch.zeros(Tq, Tk, dtype=torch.bool, device=q.device)
-                attn_mask = torch.cat([mask_main, mask_side], dim=1)  # (Tq, 2*Tk)
-                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
-            elif Tq == 1:
-                # Single token inference: attend to all cached main and side tokens
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
-            else:
-                # Chunk inference: attend to full prefix + causal within chunk (for both streams)
-                attn_mask = torch.zeros((Tq, Tk_total), dtype=torch.bool, device=q.device)
-                prefix_len = Tk - Tq
-                # Main stream
+
+            def build_mask(stream_len, allow_attend=True):
+                if not allow_attend:
+                    return torch.zeros((Tq, stream_len), dtype=torch.bool, device=q.device)
+                if kv_cache is None or Tq == stream_len:
+                    return torch.tril(torch.ones((Tq, stream_len), dtype=torch.bool, device=q.device))
+                if Tq == 1:
+                    return torch.ones((1, stream_len), dtype=torch.bool, device=q.device)
+                mask = torch.zeros((Tq, stream_len), dtype=torch.bool, device=q.device)
+                prefix_len = max(stream_len - Tq, 0)
                 if prefix_len > 0:
-                    attn_mask[:, :prefix_len] = True  # Attend to main prefix
-                attn_mask[:, prefix_len:Tk] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))  # Causal main
-                # Side stream (same pattern, offset by Tk)
-                # ABLATION: Skip side stream masking if mask_side_attention is enabled during training
-                if not (self.training and self.config.mask_side_attention):
+                    mask[:, :prefix_len] = True
+                causal_width = stream_len - prefix_len
+                if causal_width > 0:
+                    mask[:, prefix_len:] = torch.tril(torch.ones((Tq, causal_width), dtype=torch.bool, device=q.device))
+                return mask
+
+            def build_bias(mask_bool, extra_bias=None):
+                attn_bias = torch.full(mask_bool.shape, float("-inf"), dtype=q.dtype, device=q.device)
+                attn_bias = attn_bias.masked_fill(mask_bool, 0.0)
+                if extra_bias is not None:
+                    attn_bias = attn_bias + extra_bias
+                return attn_bias
+
+            if dual_softmax:
+                allow_side = not (self.training and self.config.mask_side_attention)
+                mask_main = build_mask(Tk_main, True)
+                mask_side = build_mask(Tk_main, allow_side)
+                attn_bias_main = build_bias(mask_main)
+                y_main = F.scaled_dot_product_attention(
+                    q, k_main_full, v_main_full, attn_mask=attn_bias_main, enable_gqa=enable_gqa
+                )
+                has_side = allow_side and bool(mask_side.any().item())
+                if has_side:
+                    bias_val = None
+                    if self.side_logit_bias is not None:
+                        bias_val = self.side_logit_bias.to(dtype=q.dtype, device=q.device)
+                    attn_bias_side = build_bias(mask_side, bias_val)
+                    y_side = F.scaled_dot_product_attention(
+                        q, k_side_full, v_side_full, attn_mask=attn_bias_side, enable_gqa=enable_gqa
+                    )
+                else:
+                    y_side = torch.zeros_like(y_main)
+                y = y_main + y_side
+            else:
+                k = k_combined
+                v = v_combined
+
+                def build_attn_bias(mask_main_bool, mask_side_bool):
+                    allow = torch.cat([mask_main_bool, mask_side_bool], dim=1)
+                    attn_bias = torch.full(
+                        allow.shape,
+                        float("-inf"),
+                        dtype=q.dtype,
+                        device=q.device,
+                    )
+                    attn_bias = attn_bias.masked_fill(allow, 0.0)
+                    if self.side_logit_bias is not None:
+                        bias_val = self.side_logit_bias.to(dtype=q.dtype, device=q.device)
+                        attn_bias[:, Tk_main:] = attn_bias[:, Tk_main:] + bias_val
+                    return attn_bias
+
+                if kv_cache is None or Tq == Tk_main:
+                    mask_main = torch.tril(torch.ones(Tq, Tk_main, dtype=torch.bool, device=q.device))
+                    mask_side = torch.tril(torch.ones(Tq, Tk_main, dtype=torch.bool, device=q.device))
+                    if self.training and self.config.mask_side_attention:
+                        mask_side = torch.zeros_like(mask_side)
+                    attn_bias = build_attn_bias(mask_main, mask_side)
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, enable_gqa=enable_gqa)
+                elif Tq == 1:
+                    mask_main = torch.ones(1, Tk_main, dtype=torch.bool, device=q.device)
+                    mask_side = mask_main if not (self.training and self.config.mask_side_attention) else torch.zeros_like(mask_main)
+                    attn_bias = build_attn_bias(mask_main, mask_side)
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, is_causal=False, enable_gqa=enable_gqa)
+                else:
+                    prefix_len = max(Tk_main - Tq, 0)
+                    causal_width = Tk_main - prefix_len
+                    mask_main = torch.zeros((Tq, Tk_main), dtype=torch.bool, device=q.device)
                     if prefix_len > 0:
-                        attn_mask[:, Tk:Tk+prefix_len] = True  # Attend to side prefix
-                    attn_mask[:, Tk+prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))  # Causal side
-                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+                        mask_main[:, :prefix_len] = True
+                    if causal_width > 0:
+                        causal_block = torch.tril(torch.ones((Tq, causal_width), dtype=torch.bool, device=q.device))
+                        mask_main[:, prefix_len:prefix_len + causal_width] = causal_block
+
+                    if self.training and self.config.mask_side_attention:
+                        mask_side = torch.zeros((Tq, Tk_main), dtype=torch.bool, device=q.device)
+                    else:
+                        mask_side = torch.zeros((Tq, Tk_main), dtype=torch.bool, device=q.device)
+                        if prefix_len > 0:
+                            mask_side[:, :prefix_len] = True
+                        if causal_width > 0:
+                            mask_side[:, prefix_len:prefix_len + causal_width] = causal_block
+                    attn_bias = build_attn_bias(mask_main, mask_side)
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, enable_gqa=enable_gqa)
 
         else:
             # Normal single-stream attention (higher layers or no prev_state)
@@ -242,8 +365,11 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.recurrence_active = config.recurrent_layer_state and config.recurrent_layer_state_active
         self._last_type_gate_stats = None
         self._last_side_stream_enabled = False
+        self._last_side_gate_stats = None
+        self._last_side_logit_bias = None
         self.register_buffer("type_gate_ema", torch.tensor(1.0), persistent=False)
         # Recurrent layer state: side token architecture
         if config.recurrent_layer_state:
@@ -271,6 +397,11 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
+            # Reinitialize side-specific parameters that lose data during to_empty()
+            if getattr(block.attn, "side_gate", None) is not None:
+                block.attn.side_gate.data.fill_(self.config.side_output_gate_init)
+            if getattr(block.attn, "side_logit_bias", None) is not None:
+                block.attn.side_logit_bias.data.fill_(self.config.side_logit_bias)
         # Initialize side MLP (already handled by _init_weights for Linear layers)
         # Type embeddings initialized to zeros (already done in __init__)
         # init the rotary embeddings
@@ -313,6 +444,10 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def set_recurrence_active(self, active: bool):
+        """Toggle execution of the recurrent pathway without re-instantiating the model."""
+        self.recurrence_active = bool(active) and self.config.recurrent_layer_state
+
     def estimate_flops(self):
         """ Return the estimated FLOPs per token for the model. Ref: https://arxiv.org/abs/2204.02311 """
         nparams = sum(p.numel() for p in self.parameters())
@@ -331,7 +466,22 @@ class GPT(nn.Module):
         # Type embeddings are 1D vectors, so they go to AdamW (Muon requires 2D+ matrices)
         rls_embedding_params = []
         if self.config.recurrent_layer_state:
-            rls_embedding_params = [self.E_type_main, self.E_type_side]
+            if self.E_type_main is not None:
+                rls_embedding_params.append(self.E_type_main)
+            if self.E_type_side is not None:
+                rls_embedding_params.append(self.E_type_side)
+            aux_params = []
+            for block in self.transformer.h:
+                side_gate = getattr(block.attn, "side_gate", None)
+                if side_gate is not None:
+                    aux_params.append(side_gate)
+                bias_param = getattr(block.attn, "side_logit_bias", None)
+                if bias_param is not None and bias_param.requires_grad:
+                    aux_params.append(bias_param)
+            for param in aux_params:
+                if param in matrix_params:
+                    matrix_params.remove(param)
+            rls_embedding_params.extend(aux_params)
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(rls_embedding_params)
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
@@ -361,6 +511,7 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', prev_state=None, return_state=False, side_stream_scale=1.0):
         B, T = idx.size()
+        recurrence_active = self.config.recurrent_layer_state and self.recurrence_active
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
@@ -378,16 +529,20 @@ class GPT(nn.Module):
 
         self._last_type_gate_stats = None
         self._last_side_stream_enabled = False
+        self._last_side_gate_stats = None
+        self._last_side_logit_bias = None
+        if not recurrence_active:
+            prev_state = None
 
         # ABLATION: Zero out prev_state to test if side token dominance causes failure
-        if self.config.zero_prev_state and prev_state is not None and self.config.recurrent_layer_state:
+        if self.config.zero_prev_state and prev_state is not None and recurrence_active:
             prev_state = torch.zeros_like(prev_state)
 
         # Side stream dropout: occasionally run batches without RLS entirely to keep raw competence.
         # Removing the side stream (instead of zeroing it) avoids pushing gigantic gradients through identical tokens.
         side_stream_scale = float(side_stream_scale)
 
-        if self.training and prev_state is not None and self.config.recurrent_layer_state:
+        if self.training and prev_state is not None and recurrence_active:
             if self.config.side_dropout_rate >= 1.0:
                 prev_state = None
             elif self.config.side_dropout_rate > 0.0:
@@ -396,11 +551,7 @@ class GPT(nn.Module):
 
         # Optional type gating: scale E_type_side contribution based on prev_state strength
         type_gate = None
-        if (
-            self.config.recurrent_layer_state
-            and prev_state is not None
-            and self.config.side_type_gate
-        ):
+        if recurrence_active and prev_state is not None and self.config.side_type_gate:
             prev_norm = prev_state.norm(dim=-1, keepdim=True)
             ema = self.type_gate_ema.to(prev_state.device, prev_state.dtype)
             denom = ema + self.config.side_type_gate_eps
@@ -419,10 +570,22 @@ class GPT(nn.Module):
 
         # Pack RLS components for layer 0 (if enabled)
         rls_components = None
-        if self.config.recurrent_layer_state and prev_state is not None:
-            prev_state = prev_state * side_stream_scale
+        if recurrence_active and prev_state is not None:
             rls_components = (self.E_type_main, self.E_type_side, type_gate, side_stream_scale)
             self._last_side_stream_enabled = True
+        if self.config.recurrent_layer_state and self.transformer.h:
+            attn0 = self.transformer.h[0].attn
+            side_gate_param = getattr(attn0, "side_gate", None)
+            if side_gate_param is not None:
+                gate_vals = torch.sigmoid(side_gate_param.detach().float())
+                if gate_vals.numel() > 0:
+                    gate_mean = gate_vals.mean().item()
+                    gate_max = gate_vals.max().item()
+                    gate_min = gate_vals.min().item()
+                    self._last_side_gate_stats = (gate_mean, gate_max, gate_min)
+            bias_param = getattr(attn0, "side_logit_bias", None)
+            if bias_param is not None:
+                self._last_side_logit_bias = float(bias_param.detach().item())
 
         x = norm(x)
         for block in self.transformer.h:
@@ -463,7 +626,8 @@ class GPT(nn.Module):
         Forward pass with recurrent layer state.
         Performs warmup passes to compute previous token states, then does the real forward pass.
         """
-        if not self.config.recurrent_layer_state:
+        recurrence_active = self.config.recurrent_layer_state and self.recurrence_active
+        if not recurrence_active:
             # Feature disabled, use normal forward
             return self.forward(idx, targets=targets, loss_reduction=loss_reduction)
 
@@ -499,6 +663,7 @@ class GPT(nn.Module):
         """
         assert isinstance(tokens, list)
         device = self.get_device()
+        recurrence_active = self.config.recurrent_layer_state and self.recurrence_active
         rng = None
         if temperature > 0:
             rng = torch.Generator(device=device)
@@ -509,7 +674,7 @@ class GPT(nn.Module):
         prev_state = None
 
         # If using recurrent layer state, do warmup passes on the initial prompt
-        if self.config.recurrent_layer_state:
+        if recurrence_active:
             T = ids.size(1)
             prev_state = torch.zeros(1, T, self.config.n_embd, dtype=torch.bfloat16, device=device)
             for _ in range(self.config.num_recurrence_warmup):
@@ -524,7 +689,7 @@ class GPT(nn.Module):
             prev_state = final_state[:, -1:, :]  # (1, 1, n_embd)
 
         for _ in range(max_tokens):
-            if self.config.recurrent_layer_state:
+            if recurrence_active:
                 # Generate next token with recurrent state
                 next_id = torch.tensor([[ids[0, -1].item()]], dtype=torch.long, device=device)  # Last token as (1, 1)
                 logits, final_state = self.forward(next_id, prev_state=prev_state, return_state=True)  # (1, 1, vocab_size)
