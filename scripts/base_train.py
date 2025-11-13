@@ -23,7 +23,7 @@ from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_last_step
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
@@ -51,6 +51,9 @@ side_type_gate_ema_beta = 0.01
 side_stream_initial_scale = 0.1
 side_stream_final_scale = 1.0
 side_stream_schedule_steps = 500
+resume_checkpoint_dir = ""
+resume_checkpoint_step = -1
+resume_load_optimizer = True
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
@@ -151,6 +154,22 @@ print0(f"Moving model to {device}...")
 model.to_empty(device=device)
 print0("Initializing weights...")
 model.init_weights()
+start_step = 0
+resume_meta = None
+optimizer_state_to_load = None
+if resume_checkpoint_dir:
+    ckpt_dir = os.path.expanduser(resume_checkpoint_dir)
+    ckpt_step = resume_checkpoint_step if resume_checkpoint_step >= 0 else find_last_step(ckpt_dir)
+    print0(f"Resuming from checkpoint {ckpt_dir} @ step {ckpt_step}")
+    model_state, optimizer_state, resume_meta = load_checkpoint(
+        ckpt_dir, ckpt_step, device, load_optimizer=resume_load_optimizer
+    )
+    if device.type in {"cpu", "mps"}:
+        model_state = {k: (v.float() if v.dtype == torch.bfloat16 else v) for k, v in model_state.items()}
+    model.load_state_dict(model_state, strict=True, assign=True)
+    start_step = ckpt_step
+    if optimizer_state is not None:
+        optimizer_state_to_load = optimizer_state
 orig_model = model # original, uncompiled model, for saving raw model state_dict
 print0("Compiling model (this may take a few minutes on first run)...")
 model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
@@ -183,6 +202,11 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
 print0("Setting up optimizers...")
 optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
+if optimizer_state_to_load is not None:
+    for opt, state in zip(optimizers, optimizer_state_to_load):
+        opt.load_state_dict(state)
+elif resume_checkpoint_dir and resume_load_optimizer:
+    print0("⚠️  Requested optimizer resume but state not found; starting with fresh optimizer.")
 adamw_optimizer, muon_optimizer = optimizers
 
 # Initialize the DataLoaders for train/val
@@ -228,12 +252,13 @@ def get_side_stream_scale(step, config):
 
 # -----------------------------------------------------------------------------
 # Training loop
-min_val_bpb = float("inf")
+min_val_bpb = resume_meta.get("val_bpb", float("inf")) if resume_meta is not None else float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 # note that we run +1 steps only so that we can eval and save at the end
-for step in range(num_iterations + 1):
+assert num_iterations >= start_step, f"num_iterations ({num_iterations}) must be >= resume step ({start_step})"
+for step in range(start_step, num_iterations + 1):
     last_step = step == num_iterations
     flops_so_far = num_flops_per_token * total_batch_size * step
     side_stream_scale = get_side_stream_scale(step, orig_model.config)

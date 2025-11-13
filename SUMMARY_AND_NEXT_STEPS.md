@@ -81,6 +81,24 @@ V_side ≈ E_type_side  # All 512 positions nearly identical
    - WandB: https://wandb.ai/ritz-deli-games/nanochat/runs/oqhvrezt  
    - Prints now include `gate μ/↑/↓` and `side_on` so we can inspect how often the side stream is active.
 
+6. **rls_sched_bs12 (side dropout + scheduled throttle + gate)** *(completed)*  
+   - Command:  
+     ```bash
+     cd /workspace/nanochat
+     source .venv/bin/activate
+     python -m scripts.base_train --run=rls_sched_bs12 --depth=12 --max_seq_len=512 \
+       --device_batch_size=12 --total_batch_size=6144 --num_iterations=1000 \
+       --recurrent_layer_state=True --num_recurrence_warmup=1 \
+       --side_dropout_rate=0.15 --side_type_gate=True \
+       --side_type_gate_temp=4.0 --side_type_gate_ema_beta=0.01 \
+       --side_stream_initial_scale=0.1 --side_stream_final_scale=1.0 \
+       --side_stream_schedule_steps=500 --eval_every=100 \
+       --core_metric_every=-1 --sample_every=1000 --log_every=10
+     ```
+   - Log: `/tmp/rls_sched_bs12_1k.log`
+   - WandB: https://wandb.ai/ritz-deli-games/nanochat/runs/tsqg7lwg
+   - Validation bpb: 3.3121 → 2.1876 → 2.1347 → **1.9549** (step 1000). Scale ramped from 0.1→1.0 over the first 500 steps; gate μ settled around 0.98.
+
 **Note:** We hit Muon `grad is None` assertions when launching via `torchrun` (even with `nproc_per_node=1`). Falling back to single-process `python -m` avoids that issue on the single-GPU H100 node.
 
 **Check progress / logs:**
@@ -122,7 +140,7 @@ if self.training and self.config.mask_side_attention:
 
 ### 2. scripts/base_train.py (lines 43-46)
 
-**Exposed ablation flags & telemetry toggles:**
+**Exposed ablation flags & telemetry/resume toggles:**
     ```python
     # RLS ablation flags for debugging
     mask_side_attention = False
@@ -135,6 +153,9 @@ if self.training and self.config.mask_side_attention:
     side_stream_initial_scale = 0.1
     side_stream_final_scale = 1.0
     side_stream_schedule_steps = 500
+    resume_checkpoint_dir = ""
+    resume_checkpoint_step = -1
+    resume_load_optimizer = True
     ```
 
     **Added to model_config_kwargs (line 119):**
@@ -152,6 +173,7 @@ if self.training and self.config.mask_side_attention:
     ```
 
 - Training printouts & wandb metrics now include `gate μ/↑/↓` (mean/max/min gate) and `side_on` (whether the side stream was active) whenever RLS is enabled.
+- Added checkpoint resume support: pass `--resume_checkpoint_dir=/root/.cache/nanochat/base_checkpoints/d12 --resume_checkpoint_step=1000 --num_iterations=2000` to continue training up to step 2000 (LR schedules and side-stream scaling now use the global step). Optimizer state resumes by default; disable with `--resume_load_optimizer=False`.
 
 ### 3. New Files Created
 
