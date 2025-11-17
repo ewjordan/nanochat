@@ -5,3 +5,10 @@ rustbpe/target/
 dev-ignore/
 report.md
 eval_bundle/
+
+# macOS
+.DS_Store
+
+# RLS experiment outputs (logs, checkpoints)
+local_rls_experiments/
+local_rls_experiments_full/*.swp

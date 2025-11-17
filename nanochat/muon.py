@@ -72,7 +72,8 @@ class Muon(torch.optim.Optimizer):
             params: list[Tensor] = group["params"]
             for p in params:
                 g = p.grad
-                assert g is not None
+                if g is None:
+                    continue  # Skip parameters without gradients (e.g., unused in this forward pass)
                 state = self.state[p]
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g)

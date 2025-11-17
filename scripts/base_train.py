@@ -23,7 +23,7 @@ from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_last_step
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
@@ -34,9 +34,35 @@ print_banner()
 run = "dummy" # wandb run name default ("dummy" is special - we won't log to wandb)
 # Runtime
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
+tokenizer_threads = 4 # number of threads for tokenization (set to 1 for MPS to avoid deadlocks)
 # Model architecture
 depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
 max_seq_len = 2048 # max context length
+recurrent_layer_state = False # enable recurrent layer state passing
+num_recurrence_warmup = 1 # number of warmup passes when using recurrent layer state
+# RLS ablation flags for debugging
+mask_side_attention = False # prevent attention to side tokens (ablation to test side dominance theory)
+zero_prev_state = False # zero out prev_state (ablation to test side dominance theory)
+side_dropout_rate = 0.15 # dropout rate for side stream
+side_type_gate = False # scale side type embeddings based on prev_state strength
+side_type_gate_temp = 4.0
+side_type_gate_eps = 1e-6
+side_type_gate_ema_beta = 0.01
+side_stream_initial_scale = 0.1
+side_stream_final_scale = 1.0
+side_stream_schedule_steps = 500
+side_type_scale = 1.0
+side_type_renorm = False
+side_state_rmsnorm = False
+side_output_gate = False
+side_output_gate_init = -5.0
+side_logit_bias = 0.0
+side_logit_bias_trainable = False
+recurrent_layer_state_active = True
+side_dual_softmax = False
+resume_checkpoint_dir = ""
+resume_checkpoint_step = -1
+resume_load_optimizer = True
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
@@ -58,12 +84,16 @@ eval_tokens = 20*524288 # number of tokens to evaluate val loss on
 core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
+log_every = 1 # every how many steps to print training stats to console
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
 user_config = {k: globals()[k] for k in config_keys} # will be useful for logging
+# Prevent enabling runtime recurrence when architecture is disabled
+if not recurrent_layer_state:
+    recurrent_layer_state_active = False
 # -----------------------------------------------------------------------------
 
 # Compute init
@@ -79,7 +109,9 @@ use_dummy_wandb = run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run, config=user_config)
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
+print0("Loading tokenizer...")
 tokenizer = get_tokenizer()
+print0("Loading token bytes...")
 token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
@@ -105,13 +137,62 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+print0("Creating model config...")
+model_config_kwargs = dict(
+    sequence_len=max_seq_len,
+    vocab_size=vocab_size,
+    n_layer=num_layers,
+    n_head=num_heads,
+    n_kv_head=num_kv_heads,
+    n_embd=model_dim,
+    recurrent_layer_state=recurrent_layer_state,
+    recurrent_layer_state_active=recurrent_layer_state_active,
+    num_recurrence_warmup=num_recurrence_warmup,
+    mask_side_attention=mask_side_attention,
+    zero_prev_state=zero_prev_state,
+    side_dropout_rate=side_dropout_rate,
+    side_type_gate=side_type_gate,
+    side_type_gate_temp=side_type_gate_temp,
+    side_type_gate_eps=side_type_gate_eps,
+    side_type_gate_ema_beta=side_type_gate_ema_beta,
+    side_stream_initial_scale=side_stream_initial_scale,
+    side_stream_final_scale=side_stream_final_scale,
+    side_stream_schedule_steps=side_stream_schedule_steps,
+    side_type_scale=side_type_scale,
+    side_type_renorm=side_type_renorm,
+    side_state_rmsnorm=side_state_rmsnorm,
+    side_output_gate=side_output_gate,
+    side_output_gate_init=side_output_gate_init,
+    side_logit_bias=side_logit_bias,
+    side_logit_bias_trainable=side_logit_bias_trainable,
+    side_dual_softmax=side_dual_softmax,
+)
+print0("Initializing model on meta device...")
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
     model = GPT(model_config)
+print0(f"Moving model to {device}...")
 model.to_empty(device=device)
+print0("Initializing weights...")
 model.init_weights()
+start_step = 0
+resume_meta = None
+optimizer_state_to_load = None
+if resume_checkpoint_dir:
+    ckpt_dir = os.path.expanduser(resume_checkpoint_dir)
+    ckpt_step = resume_checkpoint_step if resume_checkpoint_step >= 0 else find_last_step(ckpt_dir)
+    print0(f"Resuming from checkpoint {ckpt_dir} @ step {ckpt_step}")
+    model_state, optimizer_state, resume_meta = load_checkpoint(
+        ckpt_dir, ckpt_step, device, load_optimizer=resume_load_optimizer
+    )
+    if device.type in {"cpu", "mps"}:
+        model_state = {k: (v.float() if v.dtype == torch.bfloat16 else v) for k, v in model_state.items()}
+    model.load_state_dict(model_state, strict=True, assign=True)
+    start_step = ckpt_step
+    if optimizer_state is not None:
+        optimizer_state_to_load = optimizer_state
 orig_model = model # original, uncompiled model, for saving raw model state_dict
+print0("Compiling model (this may take a few minutes on first run)...")
 model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
@@ -140,15 +221,25 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
+print0("Setting up optimizers...")
 optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
+if optimizer_state_to_load is not None:
+    for opt, state in zip(optimizers, optimizer_state_to_load):
+        opt.load_state_dict(state)
+elif resume_checkpoint_dir and resume_load_optimizer:
+    print0("⚠️  Requested optimizer resume but state not found; starting with fresh optimizer.")
 adamw_optimizer, muon_optimizer = optimizers
 
 # Initialize the DataLoaders for train/val
+print0("Initializing data loaders...")
 base_dir = get_base_dir()
 tokens_dir = os.path.join(base_dir, "tokenized_data")
-train_loader = tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="train", device=device)
-build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="val", device=device)
+print0(f"Creating train loader (tokenizer_threads={tokenizer_threads})...")
+train_loader = tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="train", tokenizer_threads=tokenizer_threads, device=device)
+build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="val", tokenizer_threads=tokenizer_threads, device=device)
+print0("Loading first batch of data (this may take a minute)...")
 x, y = next(train_loader) # kick off load of the very first batch of data
+print0("First batch loaded successfully!")
 
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
@@ -171,19 +262,30 @@ def get_muon_momentum(it):
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
 
+def get_side_stream_scale(step, config):
+    if not config.recurrent_layer_state:
+        return 1.0
+    schedule_steps = config.side_stream_schedule_steps
+    if schedule_steps <= 0:
+        return config.side_stream_final_scale
+    frac = min(step / schedule_steps, 1.0)
+    return config.side_stream_initial_scale + (config.side_stream_final_scale - config.side_stream_initial_scale) * frac
+
 # -----------------------------------------------------------------------------
 # Training loop
-min_val_bpb = float("inf")
+min_val_bpb = resume_meta.get("val_bpb", float("inf")) if resume_meta is not None else float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 # note that we run +1 steps only so that we can eval and save at the end
-for step in range(num_iterations + 1):
+assert num_iterations >= start_step, f"num_iterations ({num_iterations}) must be >= resume step ({start_step})"
+for step in range(start_step, num_iterations + 1):
     last_step = step == num_iterations
     flops_so_far = num_flops_per_token * total_batch_size * step
+    side_stream_scale = get_side_stream_scale(step, orig_model.config)
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if last_step or step % eval_every == 0:
+    if last_step or (eval_every > 0 and step % eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
@@ -218,8 +320,9 @@ for step in range(num_iterations + 1):
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
-    if master_process and (last_step or (step > 0 and step % sample_every == 0)):
+    if master_process and (last_step or (sample_every > 0 and step > 0 and step % sample_every == 0)):
         model.eval()
+        orig_model.eval()  # ensure orig_model is also in eval mode for deterministic sampling
         prompts = [
             "The capital of France is",
             "The chemical symbol of gold is",
@@ -235,6 +338,7 @@ for step in range(num_iterations + 1):
             with autocast_ctx:
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
+        orig_model.train()  # restore orig_model to training mode
         model.train()
 
     # save checkpoint at the end of the run (only on master process)
@@ -266,7 +370,10 @@ for step in range(num_iterations + 1):
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            if recurrent_layer_state:
+                loss = orig_model.forward_with_recurrence(x, y, side_stream_scale=side_stream_scale)
+            else:
+                loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
@@ -303,7 +410,29 @@ for step in range(num_iterations + 1):
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    gate_stats = getattr(orig_model, "_last_type_gate_stats", None)
+    side_gate_stats = getattr(orig_model, "_last_side_gate_stats", None)
+    side_logit_bias = getattr(orig_model, "_last_side_logit_bias", None)
+    side_stream_enabled = bool(getattr(orig_model, "_last_side_stream_enabled", False))
+    gate_str = ""
+    gate_values = {}
+    if gate_stats is not None:
+        gate_values["type_gate"] = gate_stats
+    if side_gate_stats is not None:
+        gate_values["side_gate"] = side_gate_stats
+    gate_parts = []
+    for label, stats in gate_values.items():
+        g_mean, g_max, g_min = stats
+        gate_parts.append(f"{label} μ:{g_mean:.3f} ↑{g_max:.3f} ↓{g_min:.3f}")
+    if side_logit_bias is not None:
+        gate_parts.append(f"side_bias:{side_logit_bias:.2f}")
+    if gate_parts:
+        gate_str = " " + " | ".join(gate_parts) + f" | side_on:{int(side_stream_enabled)} |"
+    elif recurrent_layer_state:
+        gate_str = f" side_on:{int(side_stream_enabled)} |"
+    scale_str = f" scale:{side_stream_scale:.3f} |" if recurrent_layer_state else ""
+    if step % log_every == 0 or last_step:
+        print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm}{gate_str}{scale_str} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -317,6 +446,21 @@ for step in range(num_iterations + 1):
         }
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
+        if gate_stats is not None:
+            gate_mean, gate_max, gate_min = gate_stats
+            log_data["train/type_gate_mean"] = gate_mean
+            log_data["train/type_gate_max"] = gate_max
+            log_data["train/type_gate_min"] = gate_min
+        if side_gate_stats is not None:
+            sg_mean, sg_max, sg_min = side_gate_stats
+            log_data["train/side_gate_mean"] = sg_mean
+            log_data["train/side_gate_max"] = sg_max
+            log_data["train/side_gate_min"] = sg_min
+        if side_logit_bias is not None:
+            log_data["train/side_logit_bias"] = side_logit_bias
+        if recurrent_layer_state:
+            log_data["train/side_stream_enabled"] = int(side_stream_enabled)
+            log_data["train/side_stream_scale"] = side_stream_scale
         wandb_run.log(log_data)
 
 # print a few more stats

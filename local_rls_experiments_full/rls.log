@@ -1,0 +1,65 @@
+
+                                                       █████                █████
+                                                      ░░███                ░░███
+     ████████    ██████   ████████    ██████   ██████  ░███████    ██████  ███████
+    ░░███░░███  ░░░░░███ ░░███░░███  ███░░███ ███░░███ ░███░░███  ░░░░░███░░░███░
+     ░███ ░███   ███████  ░███ ░███ ░███ ░███░███ ░░░  ░███ ░███   ███████  ░███
+     ░███ ░███  ███░░███  ░███ ░███ ░███ ░███░███  ███ ░███ ░███  ███░░███  ░███ ███
+     ████ █████░░████████ ████ █████░░██████ ░░██████  ████ █████░░███████  ░░█████
+    ░░░░ ░░░░░  ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░   ░░░░░░  ░░░░ ░░░░░  ░░░░░░░░   ░░░░░
+    
+Overriding: depth = 12
+Overriding: max_seq_len = 512
+Overriding: device_batch_size = 128
+Overriding: total_batch_size = 65536
+Overriding: num_iterations = 3051
+Overriding: recurrent_layer_state = True
+Overriding: num_recurrence_warmup = 1
+Overriding: tokenizer_threads = 1
+Overriding: eval_every = -1
+Overriding: core_metric_every = -1
+Overriding: sample_every = 10000
+Overriding: log_every = 100
+Overriding: run = rls-side-tokens-d12-20251112-025934
+Autodetected device type: cuda
+2025-11-12 02:59:40,127 - nanochat.common - [32m[1mINFO[0m - Distributed world size: 1
+wandb: Currently logged in as: ewjordan (ritz-deli-games) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.21.3
+wandb: Run data is saved locally in /home/ubuntu/nanochat/wandb/run-20251112_025940-y23i4343
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run rls-side-tokens-d12-20251112-025934
+wandb: ⭐️ View project at https://wandb.ai/ritz-deli-games/nanochat
+wandb: 🚀 View run at https://wandb.ai/ritz-deli-games/nanochat/runs/y23i4343
+Loading tokenizer...
+Loading token bytes...
+Vocab size: 65,536
+num_layers: 12
+model_dim: 768
+num_heads: 6
+num_kv_heads: 6
+Tokens / micro-batch / rank: 128 x 512 = 65,536
+Tokens / micro-batch: 65,536
+Total batch size 65,536 => gradient accumulation steps: 1
+Creating model config...
+Initializing model on meta device...
+Moving model to cuda...
+Initializing weights...
+Compiling model (this may take a few minutes on first run)...
+Number of parameters: 185,599,488
+Estimated FLOPs per token: 8.682301e+08
+Using user-provided number of iterations: 3,051
+Total number of training tokens: 199,950,336
+Tokens : Params ratio: 1.08
+Total training FLOPs estimate: 1.736029e+17
+Setting up optimizers...
+Scaling the LR for the AdamW parameters ∝1/√(768/768) = 1.000000
+Initializing data loaders...
+Creating train loader (tokenizer_threads=1)...
+Loading first batch of data (this may take a minute)...
+First batch loaded successfully!
+step 00000/03051 (0.00%) | loss: 11.062500 | grad norm: 0.3340 | lrm: 1.00 | dt: 1317.14ms | tok/sec: 49,756 | mfu: 4.37 | total time: 0.00m
+step 00100/03051 (3.28%) | loss: 6.509206 | grad norm: 0.1907 | lrm: 1.00 | dt: 815.69ms | tok/sec: 80,344 | mfu: 7.05 | total time: 1.20m
+step 00200/03051 (6.56%) | loss: 6.287265 | grad norm: 0.1572 | lrm: 1.00 | dt: 834.63ms | tok/sec: 78,521 | mfu: 6.89 | total time: 2.58m
+step 00300/03051 (9.83%) | loss: 6.236086 | grad norm: 0.1800 | lrm: 1.00 | dt: 835.27ms | tok/sec: 78,460 | mfu: 6.89 | total time: 3.97m
+step 00400/03051 (13.11%) | loss: 6.261245 | grad norm: 0.2539 | lrm: 1.00 | dt: 822.15ms | tok/sec: 79,713 | mfu: 7.00 | total time: 5.36m
+step 00500/03051 (16.39%) | loss: 6.140936 | grad norm: 0.1641 | lrm: 1.00 | dt: 822.50ms | tok/sec: 79,678 | mfu: 6.99 | total time: 6.74m
